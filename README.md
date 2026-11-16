@@ -1,17 +1,13 @@
 # bus-contract
 
-A contract for an in-process bus of **hook points**: requests, events,
-alter and collect points, with listeners in an order they declare.
-Libraries declare their points and listen on them; the application
-supplies the bus.
+Traits and types for an in-process bus of hook points (requests,
+events, alter, collect) with ordered listeners.
 
-The bus is **passed in** at construction (`Documents::new(bus)`), never
-a process-global, so one process or one test can hold several
-applications, each with its own bus, or one bus shared by every
-library. One bus or several is the application's choice, never a
-library's.
+A library declares its points and listeners against the `Bus` trait.
+The application creates the bus and passes it to each library at
+construction. There is no global.
 
-## What it holds
+## Contents
 
 - **Points are types** (`Point`): an id (`doc.close`), the input every
   listener reads, the value a listener edits, and a declared kind
@@ -31,13 +27,11 @@ library's.
   naming a listener that is not there).
 - No dependencies, no `unsafe`, no async runtime.
 
-It runs nothing itself. An implementation keeps the listeners and runs
-the emits: [`egui-pop-hooks`](https://github.com/quazardous/egui-pop)'s
-`Kernel` is one (ordering, a per-listener error boundary with caught
-panics, inline and threaded deadlines, counters), or write your own and
-test against the promises documented on `Bus`.
+This crate has no implementation. One is `Kernel` in
+[`egui-pop-hooks`](https://github.com/quazardous/egui-pop). The
+guarantees an implementation must keep are documented on `Bus`.
 
-## A library declares, the application supplies
+## Example
 
 ```rust
 use std::sync::Arc;
@@ -75,9 +69,7 @@ impl Documents {
 }
 ```
 
-The application builds one bus and hands it to every library, so their
-points meet on it (another library can listen to `doc.close` at a
-declared place, `after("docs.autosave")`):
+The application creates the bus and passes it to each library:
 
 ```rust,ignore
 let bus: Arc<dyn Bus> = Arc::new(egui_pop_hooks::Kernel::new()); // or its own
@@ -86,13 +78,10 @@ let search = Search::new(bus.clone());
 print!("{}", bus_contract::order_dump(&*bus, &["doc.close"]));
 ```
 
-## Not in it (yet)
+## Not included
 
-- A journal (events with a revision, catch-up from a revision): planned
-  as a second trait once two implementations exist to cut it against.
-- Transport across processes: a listener that answers from another
-  process is the caller's transport, given a longer deadline
-  (`PLUGIN_DEADLINE`).
+- A journal (events with a revision, catch-up from a revision).
+- Transport across processes.
 
 ## License
 
