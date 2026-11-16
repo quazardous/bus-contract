@@ -1,20 +1,15 @@
 # bus-contract
 
-A bus as a **contract**: what a library publishes on and listens to,
-without choosing the bus.
-
-`log` gives Rust one logging contract: libraries call its macros, the
-application installs the logger. PHP has the same split in PSR-3
-(logging) and PSR-14 (event dispatching): a library describes a
-contract, the application provides the implementation. `bus-contract`
-does this for an in-process bus of **hook points**: requests, events,
+A contract for an in-process bus of **hook points**: requests, events,
 alter and collect points, with listeners in an order they declare.
+Libraries declare their points and listen on them; the application
+supplies the bus.
 
-One difference from `log`: there is no process-global. The bus is
-**passed in** at construction (`Documents::new(bus)`), so one process or
-one test can hold several applications, each with its own bus, or one
-bus shared by every library. One bus or several is the application's
-choice, never a library's.
+The bus is **passed in** at construction (`Documents::new(bus)`), never
+a process-global, so one process or one test can hold several
+applications, each with its own bus, or one bus shared by every
+library. One bus or several is the application's choice, never a
+library's.
 
 ## What it holds
 
