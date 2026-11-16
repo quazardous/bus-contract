@@ -116,7 +116,8 @@ pub struct ListenOpts {
     /// Runs on a thread of its own, so the emit stops waiting at the
     /// deadline. An inline listener (the default) runs on the emitting
     /// thread: it cannot be stopped, and only counts as late once it
-    /// returns.
+    /// returns. A local listener runs inline on its own thread: it is
+    /// refused with this set ([`Refused::Threaded`]).
     pub threaded: bool,
 }
 
@@ -305,6 +306,15 @@ pub enum Refused {
         /// The point.
         point: &'static str,
     },
+    /// A local listener asked for a thread of its own
+    /// ([`ListenOpts::threaded`]); it runs on the thread that registered
+    /// it.
+    Threaded {
+        /// The point.
+        point: &'static str,
+        /// The listener.
+        listener: String,
+    },
 }
 
 impl fmt::Display for Refused {
@@ -324,6 +334,10 @@ impl fmt::Display for Refused {
                 write!(f, "hook `{point}` is registered with another type")
             }
             Refused::AlreadyDeclared { point } => write!(f, "hook `{point}` is already declared"),
+            Refused::Threaded { point, listener } => write!(
+                f,
+                "hook `{point}`: the local listener `{listener}` runs on its own thread, not a new one"
+            ),
         }
     }
 }
@@ -337,6 +351,10 @@ pub struct Altered<V> {
     pub value: V,
     /// Every failure, in listener order.
     pub failures: Vec<Failure>,
+    /// The local listeners bound to another thread, in order: queued for
+    /// that thread's [`run_pending`](crate::Bus::run_pending), not run
+    /// by this emit.
+    pub deferred: Vec<String>,
 }
 
 /// The result of a [`collect`](crate::Bus::collect_any) emit.
@@ -345,6 +363,23 @@ pub struct Collected<V> {
     /// Each successful listener's value, in listener order, with its id.
     pub parts: Vec<(String, V)>,
     /// Every failure, in listener order.
+    pub failures: Vec<Failure>,
+    /// The local listeners bound to another thread, in order: queued for
+    /// that thread's [`run_pending`](crate::Bus::run_pending), not run
+    /// by this emit.
+    pub deferred: Vec<String>,
+}
+
+/// What one emit's deferred local listeners did when their thread ran
+/// them ([`Bus::run_pending`](crate::Bus::run_pending)).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingRun {
+    /// The point emitted.
+    pub point: &'static str,
+    /// The listeners that ran, in order (a listener removed since the
+    /// emit is not run).
+    pub ran: Vec<String>,
+    /// Their failures, in listener order.
     pub failures: Vec<Failure>,
 }
 
@@ -365,6 +400,9 @@ pub struct ListenerInfo {
     pub deadline: Duration,
     /// Whether it runs on a thread of its own.
     pub threaded: bool,
+    /// Whether it is a local listener, bound to the thread that
+    /// registered it.
+    pub local: bool,
     /// The `after`/`before` targets that are not registered.
     pub missing: Vec<String>,
     /// How many times it ran.

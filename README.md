@@ -27,9 +27,14 @@ construction. There is no global.
   `last`, then priority; unlisten; forget an owner; `alter` and
   `collect` emits that return every listener's failure (error, panic,
   missed deadline); failure sinks; introspection.
+- **Local listeners** (`listen_local::<P>`) for state that is not
+  `Send` (`Rc<RefCell<…>>`): bound to the thread that registered them,
+  in the same order as the other listeners. An emit from another
+  thread queues them for their thread's `run_pending()`.
 - **Typed calls on `dyn Bus`** (`declare::<P>`, `listen::<P>`,
-  `alter::<P>`, `collect::<P>`, `on_failure`), written once over the
-  erased methods: an implementation writes only those.
+  `listen_local::<P>`, `alter::<P>`, `collect::<P>`, `on_failure`,
+  `on_pending`), written once over the erased methods: an
+  implementation writes only those.
 - **A contract table** (`PointDecl`): a library's points as a `const`,
   readable before anything is built, declared with `declare_all`.
 - **Tools on the contract**: `order_dump` ("who runs when", for reviewed
@@ -86,6 +91,36 @@ let bus: Arc<dyn Bus> = Arc::new(egui_pop_hooks::Kernel::new()); // or its own
 let docs = Documents::new(bus.clone());
 let search = Search::new(bus.clone());
 print!("{}", bus_contract::order_dump(&*bus, &["doc.close"]));
+```
+
+## Local listeners
+
+A listener registered with `listen_local::<P>` may hold state that is
+not `Send`, such as an interface's `Rc<RefCell<…>>`. It is bound to the
+thread that registered it.
+
+- It is ordered with the other listeners of its point (`after`,
+  `before`, `last`, priority), keeps its owner and deadline, and shows
+  in introspection as local.
+- An emit on its thread runs it in that order with the others.
+- An emit on another thread runs the other listeners, queues the local
+  ones and names them in the result (`deferred`). The wakers added with
+  `on_pending` are called with the thread's id. The thread runs the
+  queued listeners, in order, when it calls `run_pending()`, typically
+  once per pass of its loop.
+- `unlisten` and `forget` remove local listeners too, queued runs
+  included.
+
+```rust,ignore
+let panel = Rc::new(RefCell::new(Panel::default()));
+let mine = panel.clone();
+bus.listen_local::<DocClose>("ui.panel", ListenOpts::new().after("docs.autosave"), move |doc, _| {
+    mine.borrow_mut().closed(doc);
+    Ok(())
+})?;
+bus.on_pending(move |_| ctx.request_repaint());
+// each pass of the interface's loop:
+bus.run_pending();
 ```
 
 ## Not included

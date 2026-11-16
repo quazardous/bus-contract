@@ -24,6 +24,8 @@ pub fn declare_all(bus: &dyn Bus, table: &[PointDecl]) -> Vec<Refused> {
 ///   2. doc.registry (owner docs): nothing
 ///   3. doc.invariants (owner -): last
 /// ```
+///
+/// A local listener ([`Bus::listen_local_any`]) is marked `local`.
 pub fn order_dump(bus: &dyn Bus, points: &[&str]) -> String {
     let mut out = String::new();
     for point in points {
@@ -31,6 +33,9 @@ pub fn order_dump(bus: &dyn Bus, points: &[&str]) -> String {
         out.push('\n');
         for (n, l) in bus.listeners(point).unwrap_or_default().iter().enumerate() {
             let mut declares: Vec<String> = Vec::new();
+            if l.local {
+                declares.push("local".into());
+            }
             if l.after.iter().any(|a| a == LAST) {
                 declares.push("last".into());
             }
