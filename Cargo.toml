@@ -1,0 +1,16 @@
+[package]
+name = "bus-contract"
+version = "0.1.0"
+description = "A bus as a contract, the way `log` is for logging: libraries declare typed hook points and listen with named order (after, before, last), owners and deadlines; the application supplies the implementation and decides on one bus or several. No dependencies."
+readme = "README.md"
+keywords = ["event-bus", "hooks", "listeners", "plugins", "contract"]
+categories = ["rust-patterns", "development-tools"]
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/quazardous/bus-contract"
+homepage = "https://github.com/quazardous/bus-contract"
+documentation = "https://docs.rs/bus-contract"
+authors = ["The bus-contract contributors"]
+
+[dependencies]
