@@ -940,6 +940,23 @@ fn a_fail_closed_request_turns_a_failure_into_a_refusal() {
     assert!(refused.failed);
     assert_eq!(refused.listener, "policy");
     assert_eq!(refused.reason, "policy table unreadable");
+    assert_eq!(
+        refused.to_string(),
+        "hook `command.guarded`: refused, `policy` failed: policy table unreadable"
+    );
+    let late = Failure::new(
+        "command.guarded",
+        "policy",
+        None,
+        FailureKind::Late {
+            deadline: std::time::Duration::from_millis(20),
+            took: None,
+        },
+    );
+    assert_eq!(
+        Refusal::from_failure(&late).reason,
+        "no answer within its deadline of 20ms"
+    );
 
     let points = bus.points();
     let guarded = points.iter().find(|p| p.id == "command.guarded").unwrap();

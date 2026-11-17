@@ -16,6 +16,8 @@
 - Constructors for implementations: `Altered::new`, `Collected::new`,
   `PendingRun::new`, `ListenerInfo::new`, `PointInfo::new`,
   `Failure::new`, `Refusal::new`, `Refusal::from_failure`.
+- `FailureKind` implements `Display` (the part of a failure's message
+  after the listener).
 
 Breaking, and why: these types are now `#[non_exhaustive]`, so the next
 additions to them are not breaking: `PointSpec`, `PendingRun`,

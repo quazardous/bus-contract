@@ -333,10 +333,9 @@ impl Failure {
     }
 }
 
-impl fmt::Display for Failure {
+impl fmt::Display for FailureKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "hook `{}`, listener `{}`: ", self.point, self.listener)?;
-        match &self.kind {
+        match self {
             FailureKind::Error(m) => write!(f, "failed: {m}"),
             FailureKind::Panic(m) => write!(f, "panicked: {m}"),
             FailureKind::Late {
@@ -351,6 +350,16 @@ impl fmt::Display for Failure {
             }
             FailureKind::TypeMismatch => write!(f, "the point is registered with another type"),
         }
+    }
+}
+
+impl fmt::Display for Failure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "hook `{}`, listener `{}`: {}",
+            self.point, self.listener, self.kind
+        )
     }
 }
 
@@ -497,7 +506,7 @@ impl Refusal {
     pub fn from_failure(failure: &Failure) -> Refusal {
         let reason = match &failure.kind {
             FailureKind::Error(m) | FailureKind::Panic(m) => m.clone(),
-            _ => failure.to_string(),
+            kind => kind.to_string(),
         };
         Refusal {
             point: failure.point,
