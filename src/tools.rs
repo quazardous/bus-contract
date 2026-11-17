@@ -2,15 +2,25 @@
 //! library's table, the order dump and the missing targets a test ends
 //! without.
 
-use crate::{Bus, LAST, PointDecl, Refused};
+use crate::{Bus, LAST, PointDecl, Refused, offers};
 
 /// Declares every point of a library's contract table on `bus`; the
-/// refusals (a point already declared: another library, or a second
-/// application on the same bus), in table order.
+/// refusals, in table order: a point already declared (another library,
+/// or a second application on the same bus), or a point that needs a
+/// capability the bus does not offer ([`Refused::Unsupported`], the
+/// point left undeclared).
 pub fn declare_all(bus: &dyn Bus, table: &[PointDecl]) -> Vec<Refused> {
     table
         .iter()
-        .filter_map(|d| bus.declare_point(d.key(), d.spec()).err())
+        .filter_map(|d| {
+            if let Some(&capability) = d.needs.iter().find(|c| !offers(bus, **c)) {
+                return Some(Refused::Unsupported {
+                    point: d.id,
+                    capability,
+                });
+            }
+            bus.declare_point(d.key(), d.spec()).err()
+        })
         .collect()
 }
 

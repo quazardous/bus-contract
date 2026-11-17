@@ -31,6 +31,12 @@ construction. There is no global.
   `Send` (`Rc<RefCell<…>>`): bound to the thread that registered them,
   in the same order as the other listeners. An emit from another
   thread queues them for their thread's `run_pending()`.
+- **Refusals on requests**: a listener returns `HookError::refuse(reason)`
+  and the request stops there; a point declared `fail_closed` turns a
+  listener failure into a refusal.
+- **Optional capabilities**, found at run time: `Bus::defer()` returns
+  the `Defer` capability (requests asked now, heard at the next drain on
+  the same thread) or `None`.
 - **Typed calls on `dyn Bus`** (`declare::<P>`, `listen::<P>`,
   `listen_local::<P>`, `alter::<P>`, `collect::<P>`, `on_failure`,
   `on_pending`), written once over the erased methods: an
@@ -121,6 +127,81 @@ bus.listen_local::<DocClose>("ui.panel", ListenOpts::new().after("docs.autosave"
 bus.on_pending(move |_| ctx.request_repaint());
 // each pass of the interface's loop:
 bus.run_pending();
+```
+
+## Refusals
+
+On a point declared `PointKind::Request`, a listener may refuse the
+request with a reason. The request stops: no later listener runs, the
+refusing listener's edit is dropped, and the result names the refusal
+(`Altered::refused`: point, listener, owner, reason). A refusal is not
+a failure and does not reach the failure sinks.
+
+By default a failing listener (error, panic, missed deadline) has its
+contribution dropped and the others run. On a point declared
+`fail_closed`, the failure refuses the request instead: the failure is
+reported as usual and `refused` is set with `failed: true`. A policy
+listener placed first on a fail-closed point therefore never lets the
+handler run when the policy itself breaks.
+
+```rust,ignore
+pub const POINTS: &[PointDecl] =
+    &[PointDecl::of::<CommandRun>("A command runs.").fail_closed()];
+
+bus.listen::<CommandRun>("policy", ListenOpts::new().priority(1000), |run, _| {
+    if run.origin.is_agent() && run.id == "files.delete" {
+        return Err(HookError::refuse("agents may not delete files"));
+    }
+    Ok(())
+})?;
+let out = bus.alter::<CommandRun>(run, Outcome::default());
+if let Some(refusal) = out.refused {
+    // "hook `command.run`: refused by `policy`: agents may not delete files"
+}
+```
+
+## Capabilities
+
+The `Bus` trait is the core every implementation offers. An
+implementation may offer more, each part as a trait of its own, found
+at run time through a provided method of `Bus` that returns `None` by
+default. One `dyn Bus` type works everywhere, whatever the
+implementation offers.
+
+- A library that needs a capability names it in its contract table
+  (`PointDecl::needs`). `declare_all` refuses such a point on a bus
+  without it (`Refused::Unsupported`) and leaves it undeclared.
+- A library that can do without one calls the method and falls back
+  when it gets `None`.
+- `offers(bus, Capability::Defer)` tells whether a bus has one.
+
+### Defer
+
+`Bus::defer()` returns `Option<&dyn Defer>`. A request asked through it
+returns at once; its listeners run at the next `drain()` on the same
+thread. It is for code that cannot be re-entered while it runs, such as
+an interface drawing a panel with its state borrowed.
+
+- Asks are per thread and run in ask order, each as an alter emit with
+  the listeners registered at the drain. Refusals and fail-closed
+  points apply.
+- `drain()` returns what each ask did (`PendingRun` with `ask` set: the
+  listeners that ran, failures, refusal). The asker gets nothing back.
+- An ask made during a drain waits for the next drain. An immediate
+  emit made after an ask runs before it.
+- `waiting()` counts the asks queued for the calling thread, so a host
+  can drain before it exits.
+
+```rust,ignore
+pub const POINTS: &[PointDecl] = &[PointDecl::of::<LibraryWrite>("A library write.")
+    .needs(&[Capability::Defer])];
+
+// while drawing, with the library borrowed:
+bus.defer().expect("declared with needs").ask::<LibraryWrite>(write, Vec::new());
+// after drawing, where nothing is borrowed:
+for run in bus.defer().map(|d| d.drain()).unwrap_or_default() {
+    if let Some(refusal) = run.refused { log::warn!("{refusal}"); }
+}
 ```
 
 ## Not included
