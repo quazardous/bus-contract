@@ -42,8 +42,10 @@ pub trait Point: 'static {
     const KIND: PointKind = PointKind::Alter;
 }
 
-/// What a point is for: declared, for introspection and review, not
-/// enforced (a request is an alter emit over the request's input).
+/// What a point is for, declared for introspection and review. A request
+/// is an alter emit over the request's input; only a request can be
+/// refused by a listener ([`HookError::Refuse`]) or declared fail-closed
+/// ([`PointSpec::fail_closed`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum PointKind {
@@ -72,7 +74,11 @@ impl PointKind {
 }
 
 /// A point's declaration: its description and limits, for introspection.
+///
+/// New fields may be added in a minor release: build one with
+/// [`PointSpec::new`] and the builder methods.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PointSpec {
     /// What the point builds, for people and agents reading
     /// [`Bus::points`](crate::Bus::points).
@@ -80,6 +86,11 @@ pub struct PointSpec {
     /// The deadline of the point's listeners that set none themselves;
     /// `None` takes the kernel's default.
     pub deadline: Option<Duration>,
+    /// On a [`PointKind::Request`] point, a listener that fails (an
+    /// error, a panic, a missed deadline) refuses the request instead of
+    /// having its contribution dropped: the emit stops there
+    /// ([`Refusal::failed`]). Ignored on the other kinds.
+    pub fail_closed: bool,
 }
 
 impl PointSpec {
@@ -88,12 +99,19 @@ impl PointSpec {
         PointSpec {
             description: description.into(),
             deadline: None,
+            fail_closed: false,
         }
     }
 
     /// The deadline of the point's listeners that set none themselves.
     pub fn deadline(mut self, deadline: Duration) -> PointSpec {
         self.deadline = Some(deadline);
+        self
+    }
+
+    /// A listener failure refuses the request ([`PointSpec::fail_closed`]).
+    pub fn fail_closed(mut self) -> PointSpec {
+        self.fail_closed = true;
         self
     }
 }
@@ -185,32 +203,74 @@ impl ListenOpts {
     }
 }
 
-/// The error a listener returns.
+/// What a listener returns instead of `Ok(())`: it failed, or it refuses
+/// the request.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HookError(pub String);
+#[non_exhaustive]
+pub enum HookError {
+    /// The listener failed: its contribution is dropped and the other
+    /// listeners run, unless its point is fail-closed
+    /// ([`PointSpec::fail_closed`]).
+    Failed(String),
+    /// The listener refuses the request, with a reason. On a
+    /// [`PointKind::Request`] point the emit stops: no later listener
+    /// runs, and the result names the refusal ([`Refusal`]). On another
+    /// kind it counts as [`HookError::Failed`].
+    Refuse(String),
+}
+
+impl HookError {
+    /// A failure with `message`.
+    pub fn failed(message: impl Into<String>) -> HookError {
+        HookError::Failed(message.into())
+    }
+
+    /// A refusal of the request, with `reason`.
+    pub fn refuse(reason: impl Into<String>) -> HookError {
+        HookError::Refuse(reason.into())
+    }
+
+    /// The failure's message or the refusal's reason.
+    pub fn message(&self) -> &str {
+        match self {
+            HookError::Failed(m) | HookError::Refuse(m) => m,
+        }
+    }
+
+    /// Whether the listener refuses the request.
+    pub fn is_refusal(&self) -> bool {
+        matches!(self, HookError::Refuse(_))
+    }
+}
 
 impl fmt::Display for HookError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        match self {
+            HookError::Failed(m) => f.write_str(m),
+            HookError::Refuse(r) => write!(f, "refused: {r}"),
+        }
     }
 }
 
 impl std::error::Error for HookError {}
 
+/// A failure with this message.
 impl From<String> for HookError {
     fn from(message: String) -> HookError {
-        HookError(message)
+        HookError::Failed(message)
     }
 }
 
+/// A failure with this message.
 impl From<&str> for HookError {
     fn from(message: &str) -> HookError {
-        HookError(message.to_owned())
+        HookError::Failed(message.to_owned())
     }
 }
 
 /// What went wrong with one listener during an emit.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FailureKind {
     /// The listener returned an error.
     Error(String),
@@ -235,8 +295,10 @@ pub enum FailureKind {
 }
 
 /// One listener's failure: its contribution was dropped (except for a
-/// [`FailureKind::MissingTarget`]), the other listeners ran.
+/// [`FailureKind::MissingTarget`]); the other listeners ran, unless the
+/// point is fail-closed ([`PointSpec::fail_closed`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Failure {
     /// The point emitted.
     pub point: &'static str,
@@ -249,6 +311,21 @@ pub struct Failure {
 }
 
 impl Failure {
+    /// The failure of the listener `listener` of `point`.
+    pub fn new(
+        point: &'static str,
+        listener: impl Into<String>,
+        owner: Option<String>,
+        kind: FailureKind,
+    ) -> Failure {
+        Failure {
+            point,
+            listener: listener.into(),
+            owner,
+            kind,
+        }
+    }
+
     /// Whether the failure dropped a contribution: everything but a
     /// missing ordering target. Only these reach the failure sinks.
     pub fn dropped(&self) -> bool {
@@ -256,10 +333,9 @@ impl Failure {
     }
 }
 
-impl fmt::Display for Failure {
+impl fmt::Display for FailureKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "hook `{}`, listener `{}`: ", self.point, self.listener)?;
-        match &self.kind {
+        match self {
             FailureKind::Error(m) => write!(f, "failed: {m}"),
             FailureKind::Panic(m) => write!(f, "panicked: {m}"),
             FailureKind::Late {
@@ -277,8 +353,19 @@ impl fmt::Display for Failure {
     }
 }
 
+impl fmt::Display for Failure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "hook `{}`, listener `{}`: {}",
+            self.point, self.listener, self.kind
+        )
+    }
+}
+
 /// Why a declaration or a listener was refused. Nothing was changed.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Refused {
     /// The point already has a listener with this id.
     Duplicate {
@@ -315,6 +402,15 @@ pub enum Refused {
         /// The listener.
         listener: String,
     },
+    /// The point needs a capability the bus does not offer
+    /// ([`PointDecl::needs`](crate::PointDecl::needs)); it was not
+    /// declared.
+    Unsupported {
+        /// The point.
+        point: &'static str,
+        /// The capability missing.
+        capability: Capability,
+    },
 }
 
 impl fmt::Display for Refused {
@@ -338,27 +434,141 @@ impl fmt::Display for Refused {
                 f,
                 "hook `{point}`: the local listener `{listener}` runs on its own thread, not a new one"
             ),
+            Refused::Unsupported { point, capability } => write!(
+                f,
+                "hook `{point}` needs the `{}` capability, which this bus does not offer",
+                capability.as_str()
+            ),
         }
     }
 }
 
 impl std::error::Error for Refused {}
 
+/// A capability a bus may offer beyond the core of [`Bus`](crate::Bus),
+/// found at run time ([`Bus::defer`](crate::Bus::defer)). A library names
+/// the ones its points need in its contract table
+/// ([`PointDecl::needs`](crate::PointDecl::needs)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Capability {
+    /// Requests asked now and heard at the bus's next drain on the same
+    /// thread ([`Defer`](crate::Defer)).
+    Defer,
+}
+
+impl Capability {
+    /// The capability as messages write it (`defer`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Capability::Defer => "defer",
+        }
+    }
+}
+
+/// A request stopped by one of its listeners: the listener refused it
+/// ([`HookError::Refuse`]), or failed on a fail-closed point
+/// ([`PointSpec::fail_closed`]). The listeners after it did not run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Refusal {
+    /// The point emitted.
+    pub point: &'static str,
+    /// The listener that stopped the request.
+    pub listener: String,
+    /// Its owner.
+    pub owner: Option<String>,
+    /// The reason it gave, or its failure as text.
+    pub reason: String,
+    /// Whether the listener failed (its [`Failure`] is in the result's
+    /// failures) rather than refused.
+    pub failed: bool,
+}
+
+impl Refusal {
+    /// The refusal of `point` by the listener `listener`, for `reason`.
+    pub fn new(
+        point: &'static str,
+        listener: impl Into<String>,
+        owner: Option<String>,
+        reason: impl Into<String>,
+    ) -> Refusal {
+        Refusal {
+            point,
+            listener: listener.into(),
+            owner,
+            reason: reason.into(),
+            failed: false,
+        }
+    }
+
+    /// The refusal a listener's failure makes on a fail-closed point.
+    pub fn from_failure(failure: &Failure) -> Refusal {
+        let reason = match &failure.kind {
+            FailureKind::Error(m) | FailureKind::Panic(m) => m.clone(),
+            kind => kind.to_string(),
+        };
+        Refusal {
+            point: failure.point,
+            listener: failure.listener.clone(),
+            owner: failure.owner.clone(),
+            reason,
+            failed: true,
+        }
+    }
+}
+
+impl fmt::Display for Refusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.failed {
+            write!(
+                f,
+                "hook `{}`: refused, `{}` failed: {}",
+                self.point, self.listener, self.reason
+            )
+        } else {
+            write!(
+                f,
+                "hook `{}`: refused by `{}`: {}",
+                self.point, self.listener, self.reason
+            )
+        }
+    }
+}
+
 /// The result of an [`alter`](crate::Bus::alter_any) emit.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct Altered<V> {
-    /// The value after every listener that succeeded.
+    /// The value after every listener that succeeded; when the request
+    /// was refused, as the listeners before the refusal left it.
     pub value: V,
     /// Every failure, in listener order.
     pub failures: Vec<Failure>,
     /// The local listeners bound to another thread, in order: queued for
     /// that thread's [`run_pending`](crate::Bus::run_pending), not run
-    /// by this emit.
+    /// by this emit. Empty when the request was refused.
     pub deferred: Vec<String>,
+    /// The listener that stopped the request, if one did.
+    pub refused: Option<Refusal>,
+}
+
+impl<V> Altered<V> {
+    /// An emit that left `value`, with no failure, nothing deferred and
+    /// no refusal.
+    pub fn new(value: V) -> Altered<V> {
+        Altered {
+            value,
+            failures: Vec::new(),
+            deferred: Vec::new(),
+            refused: None,
+        }
+    }
 }
 
 /// The result of a [`collect`](crate::Bus::collect_any) emit.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct Collected<V> {
     /// Each successful listener's value, in listener order, with its id.
     pub parts: Vec<(String, V)>,
@@ -366,13 +576,36 @@ pub struct Collected<V> {
     pub failures: Vec<Failure>,
     /// The local listeners bound to another thread, in order: queued for
     /// that thread's [`run_pending`](crate::Bus::run_pending), not run
-    /// by this emit.
+    /// by this emit. Empty when the request was refused.
     pub deferred: Vec<String>,
+    /// The listener that stopped the request, if one did.
+    pub refused: Option<Refusal>,
 }
 
-/// What one emit's deferred local listeners did when their thread ran
-/// them ([`Bus::run_pending`](crate::Bus::run_pending)).
+impl<V> Collected<V> {
+    /// An emit with no part, no failure, nothing deferred and no
+    /// refusal.
+    pub fn new() -> Collected<V> {
+        Collected {
+            parts: Vec::new(),
+            failures: Vec::new(),
+            deferred: Vec::new(),
+            refused: None,
+        }
+    }
+}
+
+impl<V> Default for Collected<V> {
+    fn default() -> Collected<V> {
+        Collected::new()
+    }
+}
+
+/// What listeners run later did: one emit's local listeners queued for
+/// their thread ([`Bus::run_pending`](crate::Bus::run_pending)), or one
+/// deferred request ([`Defer::drain`](crate::Defer::drain)).
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PendingRun {
     /// The point emitted.
     pub point: &'static str,
@@ -381,10 +614,30 @@ pub struct PendingRun {
     pub ran: Vec<String>,
     /// Their failures, in listener order.
     pub failures: Vec<Failure>,
+    /// The listener that stopped the request, if one did.
+    pub refused: Option<Refusal>,
+    /// For a deferred request, the number [`Defer::ask_any`](crate::Defer::ask_any)
+    /// returned when it was asked; `None` for local listeners run by
+    /// [`Bus::run_pending`](crate::Bus::run_pending).
+    pub ask: Option<u64>,
+}
+
+impl PendingRun {
+    /// A run of `point` where nothing ran yet.
+    pub fn new(point: &'static str) -> PendingRun {
+        PendingRun {
+            point,
+            ran: Vec::new(),
+            failures: Vec::new(),
+            refused: None,
+            ask: None,
+        }
+    }
 }
 
 /// A listener as introspection shows it.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ListenerInfo {
     /// Its id.
     pub id: String,
@@ -413,8 +666,30 @@ pub struct ListenerInfo {
     pub last_failure: Option<String>,
 }
 
+impl ListenerInfo {
+    /// The listener `id` with no owner, no constraint, priority 0, the
+    /// default deadline, inline, never run.
+    pub fn new(id: impl Into<String>) -> ListenerInfo {
+        ListenerInfo {
+            id: id.into(),
+            owner: None,
+            after: Vec::new(),
+            before: Vec::new(),
+            priority: 0,
+            deadline: DEFAULT_DEADLINE,
+            threaded: false,
+            local: false,
+            missing: Vec::new(),
+            runs: 0,
+            failures: 0,
+            last_failure: None,
+        }
+    }
+}
+
 /// A point as introspection shows it.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PointInfo {
     /// Its id.
     pub id: &'static str,
@@ -427,6 +702,25 @@ pub struct PointInfo {
     pub declared: bool,
     /// The deadline of its listeners that set none.
     pub deadline: Duration,
+    /// Whether a listener failure refuses the request
+    /// ([`PointSpec::fail_closed`]).
+    pub fail_closed: bool,
     /// Its listeners, in the order they run.
     pub listeners: Vec<ListenerInfo>,
+}
+
+impl PointInfo {
+    /// The point `id` of `kind`, not declared, with the default deadline
+    /// and no listener.
+    pub fn new(id: &'static str, kind: PointKind) -> PointInfo {
+        PointInfo {
+            id,
+            kind,
+            description: String::new(),
+            declared: false,
+            deadline: DEFAULT_DEADLINE,
+            fail_closed: false,
+            listeners: Vec::new(),
+        }
+    }
 }

@@ -102,6 +102,30 @@ pub type FailureSink = Arc<dyn Fn(&Failure) + Send + Sync>;
 ///   panic otherwise, as a defect of the implementation.
 /// - Listeners run with no lock held, so a listener may emit or listen.
 ///
+/// Refusals, on a point declared [`PointKind::Request`]:
+///
+/// - A listener that returns [`HookError::Refuse`] stops the request: its
+///   own edit is dropped, no later listener runs (on this thread or
+///   another: nothing is queued), and the result names the refusal
+///   ([`Altered::refused`], [`Collected::refused`]). It is not a failure
+///   and does not reach the failure sinks.
+/// - On a point declared fail-closed ([`PointSpec::fail_closed`]), a
+///   listener that fails (error, panic, missed deadline) stops the
+///   request the same way: the failure is reported as usual and the
+///   result names a refusal with [`Refusal::failed`] set. A threaded
+///   listener that misses its deadline stops it at once.
+/// - On the other kinds, [`HookError::Refuse`] counts as a failure
+///   ([`FailureKind::Error`] with the reason) and `fail_closed` is
+///   ignored.
+///
+/// Capabilities: an implementation may offer more than this core, each
+/// as a trait of its own found at run time through a provided method
+/// that returns `None` by default ([`Bus::defer`]). A library that needs
+/// one names it in its contract table ([`PointDecl::needs`]);
+/// [`declare_all`] then refuses the point on a bus without it
+/// ([`Refused::Unsupported`]). A library that can do without checks the
+/// method and falls back.
+///
 /// Local listeners ([`Bus::listen_local_any`]) are for state that is not
 /// `Send` (`Rc`, `RefCell`), such as an interface's. Each is bound to the
 /// thread that registered it:
@@ -195,6 +219,76 @@ pub trait Bus: Send + Sync {
     /// The listeners of the point `point`, in the order they run; `None`
     /// for a point nobody declared or listened to.
     fn listeners(&self, point: &str) -> Option<Vec<ListenerInfo>>;
+
+    /// The [`Defer`] capability: requests asked now, heard at the next
+    /// drain on the same thread. `None` (the default) when the
+    /// implementation does not offer it.
+    fn defer(&self) -> Option<&dyn Defer> {
+        None
+    }
+}
+
+/// Whether `bus` offers `capability`.
+pub fn offers(bus: &dyn Bus, capability: Capability) -> bool {
+    match capability {
+        Capability::Defer => bus.defer().is_some(),
+    }
+}
+
+/// A capability of a bus ([`Bus::defer`]): a request asked now, whose
+/// listeners run at the bus's next drain on the same thread.
+///
+/// It is for code that cannot be re-entered while it runs, such as an
+/// interface drawing a panel with its state borrowed: the panel asks,
+/// and the listeners run after the drawing, when the host calls
+/// [`Defer::drain`].
+///
+/// What an implementation promises:
+///
+/// - An ask is queued for the calling thread and returns at once with
+///   its number, increasing in ask order across the bus. The wakers
+///   ([`Bus::add_pending_waker`]) are called with the thread's id.
+/// - [`Defer::drain`] runs the asks queued for the calling thread, in
+///   ask order, each as an alter emit of its point with the listeners
+///   registered when it runs (one removed since the ask does not run;
+///   one added since does). Every rule of [`Bus`] holds, refusals and
+///   fail-closed points included; a local listener of another thread is
+///   queued for that thread's [`Bus::run_pending`] as usual.
+/// - Each ask's outcome is reported by the drain ([`PendingRun`], with
+///   [`PendingRun::ask`] set): the listeners that ran, their failures,
+///   a refusal. The asker gets nothing back; a listener placed last
+///   ([`ListenOpts::last`]) reads the final value.
+/// - An ask made during a drain (by a listener) waits for the next one.
+/// - An immediate emit made after an ask, before the drain, runs before
+///   it.
+pub trait Defer: Send + Sync {
+    /// Queues an alter emit of `point` with `input` and `value` for the
+    /// calling thread's next [`Defer::drain`]; the ask's number.
+    fn ask_any(&self, point: PointKey, input: AnyInput, value: AnyValue, clone: CloneFn) -> u64;
+
+    /// Runs the asks queued for the calling thread, in ask order; what
+    /// each did. Empty when nothing waits.
+    fn drain(&self) -> Vec<PendingRun>;
+
+    /// How many asks wait for the calling thread's drain (zero before a
+    /// clean exit).
+    fn waiting(&self) -> usize;
+}
+
+impl<'a> dyn Defer + 'a {
+    /// Asks the request `P` now: its listeners run at the calling
+    /// thread's next [`Defer::drain`]. The ask's number.
+    pub fn ask<P: Point>(&self, input: P::Input, value: P::Value) -> u64
+    where
+        P::Value: Clone,
+    {
+        self.ask_any(
+            PointKey::of::<P>(),
+            Arc::new(input),
+            Box::new(value),
+            clone_value::<P::Value>,
+        )
+    }
 }
 
 /// A shared bus is a bus: `&Arc<dyn Bus>` goes where `&dyn Bus` is
@@ -264,6 +358,10 @@ impl<B: Bus + ?Sized> Bus for Arc<B> {
 
     fn listeners(&self, point: &str) -> Option<Vec<ListenerInfo>> {
         (**self).listeners(point)
+    }
+
+    fn defer(&self) -> Option<&dyn Defer> {
+        (**self).defer()
     }
 }
 
@@ -356,6 +454,7 @@ impl<'a> dyn Bus + 'a {
             value: typed::<P>(out.value),
             failures: out.failures,
             deferred: out.deferred,
+            refused: out.refused,
         }
     }
 
@@ -378,6 +477,7 @@ impl<'a> dyn Bus + 'a {
                 .collect(),
             failures: out.failures,
             deferred: out.deferred,
+            refused: out.refused,
         }
     }
 
@@ -395,14 +495,14 @@ pub fn erase<P: Point>(
 ) -> AnyListener {
     Arc::new(move |input, value| {
         let Some(input) = input.downcast_ref::<P::Input>() else {
-            return Err(HookError(format!(
+            return Err(HookError::Failed(format!(
                 "`{}`: the input is not a `{}`",
                 P::ID,
                 type_name::<P::Input>()
             )));
         };
         let Some(value) = value.downcast_mut::<P::Value>() else {
-            return Err(HookError(format!(
+            return Err(HookError::Failed(format!(
                 "`{}`: the value is not a `{}`",
                 P::ID,
                 type_name::<P::Value>()
@@ -418,14 +518,14 @@ pub fn erase_local<P: Point>(
 ) -> AnyLocalListener {
     Rc::new(move |input, value| {
         let Some(input) = input.downcast_ref::<P::Input>() else {
-            return Err(HookError(format!(
+            return Err(HookError::Failed(format!(
                 "`{}`: the input is not a `{}`",
                 P::ID,
                 type_name::<P::Input>()
             )));
         };
         let Some(value) = value.downcast_mut::<P::Value>() else {
-            return Err(HookError(format!(
+            return Err(HookError::Failed(format!(
                 "`{}`: the value is not a `{}`",
                 P::ID,
                 type_name::<P::Value>()
@@ -450,6 +550,12 @@ pub struct PointDecl {
     /// The deadline of its listeners that set none; `None` takes the
     /// bus's.
     pub deadline: Option<Duration>,
+    /// Whether a listener failure refuses the request
+    /// ([`PointSpec::fail_closed`]).
+    pub fail_closed: bool,
+    /// The capabilities the point needs from the bus: [`declare_all`]
+    /// refuses it on a bus without them.
+    pub needs: &'static [Capability],
     key: fn() -> PointKey,
 }
 
@@ -461,6 +567,8 @@ impl PointDecl {
             kind: P::KIND,
             description,
             deadline: None,
+            fail_closed: false,
+            needs: &[],
             key: PointKey::of::<P>,
         }
     }
@@ -471,6 +579,20 @@ impl PointDecl {
         self
     }
 
+    /// A listener failure refuses the request
+    /// ([`PointSpec::fail_closed`]).
+    pub const fn fail_closed(mut self) -> PointDecl {
+        self.fail_closed = true;
+        self
+    }
+
+    /// The capabilities the point needs from the bus
+    /// (`.needs(&[Capability::Defer])`).
+    pub const fn needs(mut self, needs: &'static [Capability]) -> PointDecl {
+        self.needs = needs;
+        self
+    }
+
     /// The point's key.
     pub fn key(&self) -> PointKey {
         (self.key)()
@@ -478,10 +600,9 @@ impl PointDecl {
 
     /// The point's spec, as [`Bus::declare_point`] takes it.
     pub fn spec(&self) -> PointSpec {
-        let spec = PointSpec::new(self.description);
-        match self.deadline {
-            Some(d) => spec.deadline(d),
-            None => spec,
-        }
+        let mut spec = PointSpec::new(self.description);
+        spec.deadline = self.deadline;
+        spec.fail_closed = self.fail_closed;
+        spec
     }
 }

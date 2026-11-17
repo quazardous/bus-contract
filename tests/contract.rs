@@ -2,7 +2,7 @@
 //! a recording in-memory implementation written against the contract
 //! alone: the listeners in registration order, no deadlines; local
 //! listeners kept in thread-local storage, the bus holding only where
-//! they are.
+//! they are; refusals, fail-closed points and the `Defer` capability.
 
 use std::any::Any;
 use std::cell::RefCell;
@@ -13,10 +13,10 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, ThreadId};
 
 use bus_contract::{
-    Altered, AnyInput, AnyListener, AnyLocalListener, AnyValue, Bus, CloneFn, Collected, Failure,
-    FailureKind, FailureSink, FreshFn, HookError, ListenOpts, ListenerInfo, PendingRun,
-    PendingWaker, Point, PointDecl, PointInfo, PointKey, PointKind, PointSpec, Refused,
-    declare_all, missing_targets, order_dump,
+    Altered, AnyInput, AnyListener, AnyLocalListener, AnyValue, Bus, Capability, CloneFn,
+    Collected, Defer, Failure, FailureKind, FailureSink, FreshFn, HookError, ListenOpts,
+    ListenerInfo, PendingRun, PendingWaker, Point, PointDecl, PointInfo, PointKey, PointKind,
+    PointSpec, Refusal, Refused, declare_all, missing_targets, offers, order_dump,
 };
 
 thread_local! {
@@ -69,10 +69,31 @@ enum Work {
 /// An emit's local part, queued for its thread.
 struct Queued {
     thread: ThreadId,
-    point: &'static str,
+    point: PointKey,
     input: AnyInput,
     work: Work,
     ids: Vec<String>,
+}
+
+/// A request asked through `Defer`, waiting for its thread's drain.
+struct Asked {
+    thread: ThreadId,
+    ask: u64,
+    point: PointKey,
+    input: AnyInput,
+    value: AnyValue,
+    clone: CloneFn,
+}
+
+/// What one listener's answer means for the emit.
+enum Step {
+    /// Its edit counts.
+    Kept,
+    /// Its edit is dropped; the others run.
+    Dropped(Failure),
+    /// The request stops here (with the failure that stopped it, on a
+    /// fail-closed point).
+    Stop(Refusal, Option<Failure>),
 }
 
 /// Listeners in registration order, no deadlines: enough to show the
@@ -87,20 +108,31 @@ struct Recording {
     sinks: Mutex<Vec<FailureSink>>,
     wakers: Mutex<Vec<PendingWaker>>,
     queued: Mutex<Vec<Queued>>,
+    /// Offers `Defer` only when set.
+    defers: bool,
+    asked: Mutex<Vec<Asked>>,
+    next_ask: AtomicU64,
 }
 
 impl Recording {
+    fn with_defer() -> Recording {
+        Recording {
+            defers: true,
+            ..Recording::default()
+        }
+    }
+
     fn record(&self, call: String) {
         self.calls.lock().unwrap().push(call);
     }
 
-    fn run(&self, point: &'static str) -> Vec<(String, Run)> {
+    fn run(&self, point: &'static str) -> Vec<(String, Option<String>, Run)> {
         self.listeners
             .lock()
             .unwrap()
             .iter()
             .filter(|l| l.0 == point)
-            .map(|l| (l.1.clone(), l.3.clone()))
+            .map(|l| (l.1.clone(), l.2.owner.clone(), l.3.clone()))
             .collect()
     }
 
@@ -117,10 +149,16 @@ impl Recording {
         Ok(())
     }
 
+    fn wake(&self, thread: ThreadId) {
+        for wake in self.wakers.lock().unwrap().iter() {
+            wake(thread);
+        }
+    }
+
     /// Queues the deferred listeners, one emit per thread, and wakes.
     fn defer(
         &self,
-        point: &'static str,
+        point: PointKey,
         input: &AnyInput,
         deferred: &[(String, ThreadId)],
         work: impl Fn() -> Work,
@@ -139,23 +177,139 @@ impl Recording {
                     .map(|d| d.0.clone())
                     .collect(),
             });
-            for wake in self.wakers.lock().unwrap().iter() {
-                wake(thread);
-            }
+            self.wake(thread);
         }
     }
 
-    fn fail(&self, point: &'static str, listener: &str, message: String) -> Failure {
-        let failure = Failure {
-            point,
-            listener: listener.to_owned(),
-            owner: None,
-            kind: FailureKind::Error(message),
+    fn fail_closed(&self, point: &PointKey) -> bool {
+        point.kind == PointKind::Request
+            && self
+                .points
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(k, s)| k.id == point.id && s.as_ref().is_some_and(|s| s.fail_closed))
+    }
+
+    /// What a listener's answer means, its failure sent to the sinks.
+    fn judge(
+        &self,
+        point: &PointKey,
+        id: &str,
+        owner: &Option<String>,
+        answer: Result<(), HookError>,
+    ) -> Step {
+        let request = point.kind == PointKind::Request;
+        let message = match answer {
+            Ok(()) => return Step::Kept,
+            Err(HookError::Refuse(reason)) if request => {
+                return Step::Stop(Refusal::new(point.id, id, owner.clone(), reason), None);
+            }
+            Err(e) => e.message().to_owned(),
         };
+        let failure = Failure::new(point.id, id, owner.clone(), FailureKind::Error(message));
         for sink in self.sinks.lock().unwrap().iter() {
             sink(&failure);
         }
-        failure
+        if self.fail_closed(point) {
+            Step::Stop(Refusal::from_failure(&failure), Some(failure))
+        } else {
+            Step::Dropped(failure)
+        }
+    }
+
+    /// An alter emit; the listeners that ran on this thread with it.
+    fn alter(
+        &self,
+        point: PointKey,
+        input: AnyInput,
+        mut value: AnyValue,
+        clone: CloneFn,
+    ) -> (Altered<AnyValue>, Vec<String>) {
+        let mut ran = Vec::new();
+        let mut failures = Vec::new();
+        let mut deferred = Vec::new();
+        let mut refused = None;
+        for (id, owner, run) in self.run(point.id) {
+            let mut v = clone(&*value);
+            let Some(answer) = run.call(&*input, &mut *v) else {
+                deferred.push((id, run.thread().unwrap()));
+                continue;
+            };
+            ran.push(id.clone());
+            match self.judge(&point, &id, &owner, answer) {
+                Step::Kept => value = v,
+                Step::Dropped(f) => failures.push(f),
+                Step::Stop(r, f) => {
+                    failures.extend(f);
+                    refused = Some(r);
+                    break;
+                }
+            }
+        }
+        if refused.is_some() {
+            deferred.clear();
+        }
+        self.defer(point, &input, &deferred, || {
+            Work::Alter(clone(&*value), clone)
+        });
+        let mut out = Altered::new(value);
+        out.failures = failures;
+        out.deferred = deferred.into_iter().map(|d| d.0).collect();
+        out.refused = refused;
+        (out, ran)
+    }
+}
+
+impl Defer for Recording {
+    fn ask_any(&self, point: PointKey, input: AnyInput, value: AnyValue, clone: CloneFn) -> u64 {
+        self.record(format!("ask {}", point.id));
+        let ask = self.next_ask.fetch_add(1, Ordering::Relaxed);
+        let thread = thread::current().id();
+        self.asked.lock().unwrap().push(Asked {
+            thread,
+            ask,
+            point,
+            input,
+            value,
+            clone,
+        });
+        self.wake(thread);
+        ask
+    }
+
+    fn drain(&self) -> Vec<PendingRun> {
+        let here = thread::current().id();
+        // Taken at once: an ask made while draining waits for the next.
+        let mine: Vec<Asked> = {
+            let mut asked = self.asked.lock().unwrap();
+            let (mine, rest) = std::mem::take(&mut *asked)
+                .into_iter()
+                .partition(|a| a.thread == here);
+            *asked = rest;
+            mine
+        };
+        mine.into_iter()
+            .map(|a| {
+                let (out, ran) = self.alter(a.point, a.input, a.value, a.clone);
+                let mut run = PendingRun::new(a.point.id);
+                run.ran = ran;
+                run.failures = out.failures;
+                run.refused = out.refused;
+                run.ask = Some(a.ask);
+                run
+            })
+            .collect()
+    }
+
+    fn waiting(&self) -> usize {
+        let here = thread::current().id();
+        self.asked
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|a| a.thread == here)
+            .count()
     }
 }
 
@@ -211,16 +365,15 @@ impl Bus for Recording {
         };
         mine.into_iter()
             .map(|q| {
-                let mut ran = Vec::new();
-                let mut failures = Vec::new();
+                let mut out = PendingRun::new(q.point.id);
                 let mut value = match &q.work {
                     Work::Alter(v, clone) => Some(clone(&**v)),
                     Work::Collect(_) => None,
                 };
                 // Still registered now: one removed since the emit is skipped.
-                let now = self.run(q.point);
+                let now = self.run(q.point.id);
                 for id in &q.ids {
-                    let Some((_, run)) = now.iter().find(|(i, _)| i == id) else {
+                    let Some((_, owner, run)) = now.iter().find(|(i, ..)| i == id) else {
                         continue;
                     };
                     let mut v = match (&q.work, &value) {
@@ -228,25 +381,25 @@ impl Bus for Recording {
                         (Work::Collect(fresh), _) => fresh(),
                         (Work::Alter(..), None) => unreachable!(),
                     };
-                    match run.call(&*q.input, &mut *v) {
-                        Some(Ok(())) => {
-                            ran.push(id.clone());
+                    let Some(answer) = run.call(&*q.input, &mut *v) else {
+                        continue;
+                    };
+                    out.ran.push(id.clone());
+                    match self.judge(&q.point, id, owner, answer) {
+                        Step::Kept => {
                             if value.is_some() {
                                 value = Some(v);
                             }
                         }
-                        Some(Err(e)) => {
-                            ran.push(id.clone());
-                            failures.push(self.fail(q.point, id, e.0));
+                        Step::Dropped(f) => out.failures.push(f),
+                        Step::Stop(r, f) => {
+                            out.failures.extend(f);
+                            out.refused = Some(r);
+                            break;
                         }
-                        None => {}
                     }
                 }
-                PendingRun {
-                    point: q.point,
-                    ran,
-                    failures,
-                }
+                out
             })
             .collect()
     }
@@ -273,49 +426,37 @@ impl Bus for Recording {
         &self,
         point: PointKey,
         input: AnyInput,
-        mut value: AnyValue,
+        value: AnyValue,
         clone: CloneFn,
     ) -> Altered<AnyValue> {
         self.record(format!("alter {}", point.id));
-        let mut failures = Vec::new();
-        let mut deferred = Vec::new();
-        for (id, run) in self.run(point.id) {
-            let mut v = clone(&*value);
-            match run.call(&*input, &mut *v) {
-                Some(Ok(())) => value = v,
-                Some(Err(e)) => failures.push(self.fail(point.id, &id, e.0)),
-                None => deferred.push((id, run.thread().unwrap())),
-            }
-        }
-        self.defer(point.id, &input, &deferred, || {
-            Work::Alter(clone(&*value), clone)
-        });
-        Altered {
-            value,
-            failures,
-            deferred: deferred.into_iter().map(|d| d.0).collect(),
-        }
+        self.alter(point, input, value, clone).0
     }
 
     fn collect_any(&self, point: PointKey, input: AnyInput, fresh: FreshFn) -> Collected<AnyValue> {
         self.record(format!("collect {}", point.id));
-        let mut parts = Vec::new();
-        let mut failures = Vec::new();
+        let mut out = Collected::new();
         let mut deferred = Vec::new();
-        for (id, run) in self.run(point.id) {
+        for (id, owner, run) in self.run(point.id) {
             let mut v = fresh();
-            match run.call(&*input, &mut *v) {
-                Some(Ok(())) => parts.push((id, v)),
-                Some(Err(e)) => failures.push(self.fail(point.id, &id, e.0)),
-                None => deferred.push((id, run.thread().unwrap())),
+            let Some(answer) = run.call(&*input, &mut *v) else {
+                deferred.push((id, run.thread().unwrap()));
+                continue;
+            };
+            match self.judge(&point, &id, &owner, answer) {
+                Step::Kept => out.parts.push((id, v)),
+                Step::Dropped(f) => out.failures.push(f),
+                Step::Stop(r, f) => {
+                    out.failures.extend(f);
+                    out.refused = Some(r);
+                    deferred.clear();
+                    break;
+                }
             }
         }
-        self.defer(point.id, &input, &deferred, || Work::Collect(fresh));
-        Collected {
-            parts,
-            failures,
-            deferred: deferred.into_iter().map(|d| d.0).collect(),
-        }
+        self.defer(point, &input, &deferred, || Work::Collect(fresh));
+        out.deferred = deferred.into_iter().map(|d| d.0).collect();
+        out
     }
 
     fn add_failure_sink(&self, sink: FailureSink) {
@@ -327,16 +468,15 @@ impl Bus for Recording {
             .lock()
             .unwrap()
             .iter()
-            .map(|(k, s)| PointInfo {
-                id: k.id,
-                kind: k.kind,
-                description: s
-                    .as_ref()
-                    .map(|s| s.description.clone())
-                    .unwrap_or_default(),
-                declared: s.is_some(),
-                deadline: bus_contract::DEFAULT_DEADLINE,
-                listeners: self.listeners(k.id).unwrap_or_default(),
+            .map(|(k, s)| {
+                let mut info = PointInfo::new(k.id, k.kind);
+                if let Some(s) = s {
+                    info.description = s.description.clone();
+                    info.declared = true;
+                    info.fail_closed = s.fail_closed;
+                }
+                info.listeners = self.listeners(k.id).unwrap_or_default();
+                info
             })
             .collect()
     }
@@ -352,29 +492,29 @@ impl Bus for Recording {
             listeners
                 .iter()
                 .filter(|l| l.0 == point)
-                .map(|l| ListenerInfo {
-                    id: l.1.clone(),
-                    owner: l.2.owner.clone(),
-                    after: l.2.after.clone(),
-                    before: l.2.before.clone(),
-                    priority: l.2.priority,
-                    deadline: bus_contract::DEFAULT_DEADLINE,
-                    threaded: l.2.threaded,
-                    local: matches!(l.3, Run::Local(..)),
-                    missing: l
-                        .2
-                        .after
-                        .iter()
-                        .chain(&l.2.before)
-                        .filter(|t| *t != bus_contract::LAST && !ids.contains(&t.as_str()))
-                        .cloned()
-                        .collect(),
-                    runs: 0,
-                    failures: 0,
-                    last_failure: None,
+                .map(|l| {
+                    let mut info = ListenerInfo::new(l.1.clone());
+                    info.owner = l.2.owner.clone();
+                    info.after = l.2.after.clone();
+                    info.before = l.2.before.clone();
+                    info.priority = l.2.priority;
+                    info.threaded = l.2.threaded;
+                    info.local = matches!(l.3, Run::Local(..));
+                    info.missing =
+                        l.2.after
+                            .iter()
+                            .chain(&l.2.before)
+                            .filter(|t| *t != bus_contract::LAST && !ids.contains(&t.as_str()))
+                            .cloned()
+                            .collect();
+                    info
                 })
                 .collect(),
         )
+    }
+
+    fn defer(&self) -> Option<&dyn Defer> {
+        self.defers.then_some(self as &dyn Defer)
     }
 }
 
@@ -567,10 +707,10 @@ fn local_listeners_keep_their_place_and_run_on_their_thread() {
     let ran = bus.run_pending();
     assert_eq!(
         ran,
-        [PendingRun {
-            point: "doc.close",
-            ran: vec!["ui.panel".into()],
-            failures: vec![],
+        [{
+            let mut run = PendingRun::new("doc.close");
+            run.ran = vec!["ui.panel".into()];
+            run
         }]
     );
     assert_eq!(
@@ -648,4 +788,357 @@ fn forget_removes_local_listeners_queued_or_not() {
             listener: "ui.slow".into()
         })
     );
+}
+
+/// A command run, as a request whose listeners may refuse it.
+struct CommandRun;
+impl Point for CommandRun {
+    const ID: &'static str = "command.run";
+    const KIND: PointKind = PointKind::Request;
+    type Input = String;
+    type Value = Vec<String>;
+}
+
+/// The same request, declared fail-closed.
+struct GuardedRun;
+impl Point for GuardedRun {
+    const ID: &'static str = "command.guarded";
+    const KIND: PointKind = PointKind::Request;
+    type Input = String;
+    type Value = Vec<String>;
+}
+
+/// A request heard after the current pass.
+struct LibraryWrite;
+impl Point for LibraryWrite {
+    const ID: &'static str = "library.write";
+    const KIND: PointKind = PointKind::Request;
+    type Input = String;
+    type Value = Vec<String>;
+}
+
+const COMMAND_POINTS: &[PointDecl] = &[
+    PointDecl::of::<CommandRun>("A command runs."),
+    PointDecl::of::<GuardedRun>("A command runs, its policy fail-closed.").fail_closed(),
+];
+
+const LIBRARY_POINTS: &[PointDecl] =
+    &[
+        PointDecl::of::<LibraryWrite>("A library write, heard after drawing.")
+            .needs(&[Capability::Defer]),
+    ];
+
+/// Three listeners in order: `policy`, `audit`, `handler`; `policy`
+/// answers with `policy`.
+fn command_listeners<P: Point<Input = String, Value = Vec<String>>>(
+    bus: &dyn Bus,
+    policy: impl Fn(&str) -> Result<(), HookError> + Send + Sync + 'static,
+) {
+    bus.listen::<P>(
+        "policy",
+        ListenOpts::new().owner("policy"),
+        move |cmd, did| {
+            did.push("policy".into());
+            policy(cmd)
+        },
+    )
+    .unwrap();
+    bus.listen::<P>("audit", ListenOpts::new(), |_, did| {
+        did.push("audit".into());
+        Ok(())
+    })
+    .unwrap();
+    bus.listen::<P>("handler", ListenOpts::new(), |cmd, did| {
+        did.push(format!("ran {cmd}"));
+        Ok(())
+    })
+    .unwrap();
+}
+
+/// A listener refusing a request stops it: no later listener runs, its
+/// own edit is dropped, the result names it, and it is no failure.
+#[test]
+fn a_refusal_stops_the_request() {
+    let bus = bus();
+    declare_all(&*bus, COMMAND_POINTS);
+    command_listeners::<CommandRun>(&*bus, |cmd| {
+        if cmd == "delete" {
+            Err(HookError::refuse("agents may not delete"))
+        } else {
+            Ok(())
+        }
+    });
+    let sunk = Arc::new(Mutex::new(0));
+    let s = sunk.clone();
+    bus.on_failure(move |_| *s.lock().unwrap() += 1);
+
+    let out = bus.alter::<CommandRun>("open".into(), vec![]);
+    assert_eq!(out.value, ["policy", "audit", "ran open"]);
+    assert!(out.refused.is_none());
+
+    let out = bus.alter::<CommandRun>("delete".into(), vec![]);
+    assert_eq!(
+        out.value,
+        Vec::<String>::new(),
+        "nothing ran past the refusal"
+    );
+    let refused = out.refused.unwrap();
+    assert_eq!(refused.listener, "policy");
+    assert_eq!(refused.owner.as_deref(), Some("policy"));
+    assert_eq!(refused.reason, "agents may not delete");
+    assert!(!refused.failed);
+    assert_eq!(
+        refused.to_string(),
+        "hook `command.run`: refused by `policy`: agents may not delete"
+    );
+    assert!(out.failures.is_empty());
+    assert_eq!(*sunk.lock().unwrap(), 0, "a refusal is not a failure");
+}
+
+/// Off a request, a refusal counts as a failure: dropped, the others run.
+#[test]
+fn a_refusal_off_a_request_is_a_failure() {
+    let bus = bus();
+    bus.listen::<Findings>("picky", ListenOpts::new(), |_, out| {
+        out.push("picky".into());
+        Err(HookError::refuse("no"))
+    })
+    .unwrap();
+    bus.listen::<Findings>("disk", ListenOpts::new(), |_, out| {
+        out.push("full".into());
+        Ok(())
+    })
+    .unwrap();
+    let out = bus.alter::<Findings>((), vec![]);
+    assert_eq!(out.value, ["full"]);
+    assert!(out.refused.is_none());
+    assert_eq!(out.failures[0].kind, FailureKind::Error("no".into()));
+}
+
+/// A failing listener is dropped on an ordinary request and the handler
+/// runs (fail-open); on a fail-closed one the failure refuses it.
+#[test]
+fn a_fail_closed_request_turns_a_failure_into_a_refusal() {
+    let bus = bus();
+    assert!(declare_all(&*bus, COMMAND_POINTS).is_empty());
+    command_listeners::<CommandRun>(&*bus, |_| Err("policy table unreadable".into()));
+    command_listeners::<GuardedRun>(&*bus, |_| Err("policy table unreadable".into()));
+
+    let open = bus.alter::<CommandRun>("delete".into(), vec![]);
+    assert_eq!(open.value, ["audit", "ran delete"], "fail-open");
+    assert!(open.refused.is_none());
+    assert_eq!(open.failures.len(), 1);
+
+    let closed = bus.alter::<GuardedRun>("delete".into(), vec![]);
+    assert_eq!(
+        closed.value,
+        Vec::<String>::new(),
+        "the handler did not run"
+    );
+    assert_eq!(closed.failures.len(), 1, "the failure is still reported");
+    let refused = closed.refused.unwrap();
+    assert!(refused.failed);
+    assert_eq!(refused.listener, "policy");
+    assert_eq!(refused.reason, "policy table unreadable");
+    assert_eq!(
+        refused.to_string(),
+        "hook `command.guarded`: refused, `policy` failed: policy table unreadable"
+    );
+    let late = Failure::new(
+        "command.guarded",
+        "policy",
+        None,
+        FailureKind::Late {
+            deadline: std::time::Duration::from_millis(20),
+            took: None,
+        },
+    );
+    assert_eq!(
+        Refusal::from_failure(&late).reason,
+        "no answer within its deadline of 20ms"
+    );
+
+    let points = bus.points();
+    let guarded = points.iter().find(|p| p.id == "command.guarded").unwrap();
+    assert!(guarded.fail_closed);
+    assert!(COMMAND_POINTS[1].spec().fail_closed);
+}
+
+/// A refused request queues nothing for another thread's local
+/// listeners; a refusal among queued local listeners stops the rest.
+#[test]
+fn a_refusal_stops_local_listeners_too() {
+    let bus = bus();
+    declare_all(&*bus, COMMAND_POINTS);
+    bus.listen_local::<CommandRun>("ui.confirm", ListenOpts::new(), |cmd, did| {
+        if cmd == "delete" {
+            return Err(HookError::refuse("the user said no"));
+        }
+        did.push("confirmed".into());
+        Ok(())
+    })
+    .unwrap();
+    bus.listen_local::<CommandRun>("ui.after", ListenOpts::new(), |_, did| {
+        did.push("after".into());
+        Ok(())
+    })
+    .unwrap();
+    bus.listen::<CommandRun>("gate", ListenOpts::new(), |cmd, _| {
+        if cmd == "format" {
+            Err(HookError::refuse("never"))
+        } else {
+            Ok(())
+        }
+    })
+    .unwrap();
+
+    let other = bus.clone();
+    let out = thread::spawn(move || other.alter::<CommandRun>("format".into(), vec![]))
+        .join()
+        .unwrap();
+    assert_eq!(out.refused.unwrap().listener, "gate");
+    assert!(out.deferred.is_empty(), "a refused request queues nothing");
+    assert!(bus.run_pending().is_empty());
+
+    let other = bus.clone();
+    let out = thread::spawn(move || other.alter::<CommandRun>("delete".into(), vec![]))
+        .join()
+        .unwrap();
+    assert_eq!(out.deferred, ["ui.confirm", "ui.after"]);
+    let ran = bus.run_pending();
+    assert_eq!(ran[0].ran, ["ui.confirm"]);
+    assert_eq!(ran[0].refused.as_ref().unwrap().reason, "the user said no");
+    assert_eq!(ran[0].ask, None);
+}
+
+/// A bus without `Defer` says so; a table needing it is refused clearly
+/// and its point left undeclared.
+#[test]
+fn a_point_needing_a_missing_capability_is_refused() {
+    let bus = bus();
+    assert!(bus.defer().is_none());
+    assert!(!offers(&*bus, Capability::Defer));
+    let refused = declare_all(&*bus, LIBRARY_POINTS);
+    assert_eq!(
+        refused,
+        [Refused::Unsupported {
+            point: "library.write",
+            capability: Capability::Defer
+        }]
+    );
+    assert_eq!(
+        refused[0].to_string(),
+        "hook `library.write` needs the `defer` capability, which this bus does not offer"
+    );
+    assert!(bus.points().is_empty(), "not declared");
+
+    let bus: Arc<dyn Bus> = Arc::new(Recording::with_defer());
+    assert!(offers(&*bus, Capability::Defer));
+    assert!(declare_all(&*bus, LIBRARY_POINTS).is_empty());
+    // Through `Arc<B>` too.
+    let shared = Arc::new(Recording::with_defer());
+    assert!(Bus::defer(&shared).is_some());
+}
+
+/// Asks are queued, run at the drain in ask order with every listener,
+/// refusals and failures reported; an ask made while draining waits for
+/// the next drain; an immediate emit after an ask runs first.
+#[test]
+fn deferred_requests_run_at_the_drain_in_ask_order() {
+    let recording = Arc::new(Recording::with_defer());
+    let bus: Arc<dyn Bus> = recording.clone();
+    declare_all(&*bus, LIBRARY_POINTS);
+    let heard: Arc<Mutex<Vec<String>>> = Arc::default();
+    let h = heard.clone();
+    let again = bus.clone();
+    bus.listen::<LibraryWrite>("persist", ListenOpts::new(), move |what, did| {
+        if what == "locked" {
+            return Err(HookError::refuse("the library is read-only"));
+        }
+        if what == "broken" {
+            return Err("disk full".into());
+        }
+        h.lock().unwrap().push(what.clone());
+        did.push(format!("wrote {what}"));
+        if what == "rename" {
+            // Heard at the next drain, not this one.
+            again
+                .defer()
+                .unwrap()
+                .ask::<LibraryWrite>("reindex".into(), vec![]);
+        }
+        Ok(())
+    })
+    .unwrap();
+    let woken = Arc::new(Mutex::new(0));
+    let w = woken.clone();
+    bus.on_pending(move |_| *w.lock().unwrap() += 1);
+
+    let defer = bus.defer().unwrap();
+    let first = defer.ask::<LibraryWrite>("rename".into(), vec![]);
+    let second = defer.ask::<LibraryWrite>("locked".into(), vec![]);
+    defer.ask::<LibraryWrite>("broken".into(), vec![]);
+    assert!(second > first);
+    assert_eq!(*woken.lock().unwrap(), 3);
+    assert!(
+        heard.lock().unwrap().is_empty(),
+        "nothing heard before the drain"
+    );
+    assert_eq!(defer.waiting(), 3);
+
+    // An immediate emit made after the asks runs first.
+    bus.alter::<LibraryWrite>("now".into(), vec![]);
+    assert_eq!(*heard.lock().unwrap(), ["now"]);
+
+    let ran = defer.drain();
+    assert_eq!(ran.len(), 3);
+    assert_eq!(ran[0].ask, Some(first));
+    assert_eq!(ran[0].ran, ["persist"]);
+    assert!(ran[0].refused.is_none() && ran[0].failures.is_empty());
+    assert_eq!(ran[1].ask, Some(second));
+    assert_eq!(
+        ran[1].refused.as_ref().unwrap().reason,
+        "the library is read-only"
+    );
+    assert_eq!(
+        ran[2].failures[0].kind,
+        FailureKind::Error("disk full".into())
+    );
+    assert_eq!(*heard.lock().unwrap(), ["now", "rename"]);
+
+    // The ask made while draining waited for this drain.
+    assert_eq!(defer.waiting(), 1);
+    let ran = defer.drain();
+    assert_eq!(ran.len(), 1);
+    assert_eq!(*heard.lock().unwrap(), ["now", "rename", "reindex"]);
+    assert!(defer.drain().is_empty());
+    assert_eq!(defer.waiting(), 0);
+}
+
+/// Asks are per thread: another thread's asks wait for its own drain.
+#[test]
+fn deferred_requests_belong_to_the_asking_thread() {
+    let bus: Arc<dyn Bus> = Arc::new(Recording::with_defer());
+    let heard: Arc<Mutex<Vec<String>>> = Arc::default();
+    let h = heard.clone();
+    bus.listen::<LibraryWrite>("persist", ListenOpts::new(), move |what, _| {
+        h.lock().unwrap().push(what.clone());
+        Ok(())
+    })
+    .unwrap();
+    let other = bus.clone();
+    let (drained_here, ran_there) = thread::spawn(move || {
+        let defer = other.defer().unwrap();
+        defer.ask::<LibraryWrite>("there".into(), vec![]);
+        (defer.waiting(), defer.drain().len())
+    })
+    .join()
+    .unwrap();
+    assert_eq!((drained_here, ran_there), (1, 1));
+    bus.defer()
+        .unwrap()
+        .ask::<LibraryWrite>("here".into(), vec![]);
+    assert_eq!(*heard.lock().unwrap(), ["there"]);
+    assert_eq!(bus.defer().unwrap().drain().len(), 1);
+    assert_eq!(*heard.lock().unwrap(), ["there", "here"]);
 }

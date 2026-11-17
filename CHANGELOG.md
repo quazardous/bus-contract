@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.3.0
+
+- Refusals: a listener returns `HookError::Refuse` (`HookError::refuse`)
+  and a request stops there; the result names it (`Refusal`, in
+  `Altered::refused`, `Collected::refused`, `PendingRun::refused`).
+- Fail-closed points: `PointSpec::fail_closed` / `PointDecl::fail_closed`
+  turn a listener failure on a request into a refusal;
+  `PointInfo::fail_closed` shows it.
+- Optional capabilities: `Bus::defer()` (provided, `None` by default)
+  returns the `Defer` capability: `ask_any` / typed `ask::<P>`, `drain`,
+  `waiting`. `PendingRun::ask` numbers a deferred request's run.
+- `Capability`, `offers`, `PointDecl::needs`; `declare_all` refuses a
+  point needing a capability the bus lacks (`Refused::Unsupported`).
+- Constructors for implementations: `Altered::new`, `Collected::new`,
+  `PendingRun::new`, `ListenerInfo::new`, `PointInfo::new`,
+  `Failure::new`, `Refusal::new`, `Refusal::from_failure`.
+- `FailureKind` implements `Display` (the part of a failure's message
+  after the listener).
+
+Breaking, and why: these types are now `#[non_exhaustive]`, so the next
+additions to them are not breaking: `PointSpec`, `PendingRun`,
+`ListenerInfo`, `PointInfo`, `Failure`, `Altered`, `Collected`,
+`Refusal`, `HookError`, `FailureKind`, `Refused`, `Capability`.
+`HookError` is now an enum (`Failed`, `Refuse`).
+
+Migration from 0.2:
+
+- Build the types above with their constructor, then set the public
+  fields: `PendingRun { point, ran, failures }` becomes
+  `let mut run = PendingRun::new(point); run.ran = ran; run.failures = failures;`.
+- `HookError(message)` becomes `HookError::failed(message)` (or
+  `message.into()`); `error.0` becomes `error.message()`.
+- A `match` on `FailureKind` or `Refused` outside this crate needs a
+  `_` arm.
+- An implementation of `Bus` needs no new method. It builds its results
+  with the constructors, honours refusals and `fail_closed` on request
+  points (see `Bus`), and may offer `Defer` by overriding `Bus::defer`.
+
 ## 0.2.0
 
 - Local listeners: `Bus::listen_local_any` and the typed
