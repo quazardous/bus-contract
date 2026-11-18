@@ -2,7 +2,8 @@
 //! a recording in-memory implementation written against the contract
 //! alone: the listeners in registration order, no deadlines; local
 //! listeners kept in thread-local storage, the bus holding only where
-//! they are; refusals, fail-closed points and the `Defer` capability.
+//! they are; refusals, fail-closed points and the `Defer` capability;
+//! the `Timings` capability's types and its absence.
 
 use std::any::Any;
 use std::cell::RefCell;
@@ -15,8 +16,9 @@ use std::thread::{self, ThreadId};
 use bus_contract::{
     Altered, AnyInput, AnyListener, AnyLocalListener, AnyValue, Bus, Capability, CloneFn,
     Collected, Defer, Failure, FailureKind, FailureSink, FreshFn, HookError, ListenOpts,
-    ListenerInfo, PendingRun, PendingWaker, Point, PointDecl, PointInfo, PointKey, PointKind,
-    PointSpec, Refusal, Refused, declare_all, missing_targets, offers, order_dump,
+    ListenerInfo, ListenerTimings, OverBudget, PendingRun, PendingWaker, Point, PointDecl,
+    PointInfo, PointKey, PointKind, PointSpec, PointTimings, Refusal, Refused, TimingStats,
+    Timings, declare_all, missing_targets, offers, order_dump,
 };
 
 thread_local! {
@@ -1141,4 +1143,110 @@ fn deferred_requests_belong_to_the_asking_thread() {
     assert_eq!(*heard.lock().unwrap(), ["there"]);
     assert_eq!(bus.defer().unwrap().drain().len(), 1);
     assert_eq!(*heard.lock().unwrap(), ["there", "here"]);
+}
+
+/// A budget in a contract table reaches the spec the bus is given; it
+/// needs no capability, so a bus without `Timings` declares the point.
+#[test]
+fn a_budget_reaches_the_spec_and_needs_no_capability() {
+    const TABLE: &[PointDecl] =
+        &[PointDecl::of::<DocClose>("A document closes.")
+            .budget(std::time::Duration::from_millis(4))];
+    assert_eq!(TABLE[0].budget, Some(std::time::Duration::from_millis(4)));
+    assert_eq!(
+        TABLE[0].spec().budget,
+        Some(std::time::Duration::from_millis(4))
+    );
+    assert_eq!(
+        PointSpec::new("x")
+            .budget(std::time::Duration::from_millis(2))
+            .budget,
+        Some(std::time::Duration::from_millis(2))
+    );
+
+    let recording = Arc::new(Recording::default());
+    let bus: Arc<dyn Bus> = recording.clone();
+    assert!(bus.timings().is_none());
+    assert!(!offers(&*bus, Capability::Timings));
+    assert!(Bus::timings(&recording).is_none(), "through `Arc<B>`");
+    assert!(declare_all(&*bus, TABLE).is_empty());
+    let points = recording.points.lock().unwrap();
+    let spec = points[0].1.as_ref().unwrap();
+    assert_eq!(spec.budget, Some(std::time::Duration::from_millis(4)));
+    assert_eq!(Capability::Timings.as_str(), "timings");
+}
+
+/// The timing types: the mean, the slowest listeners first, and a pass
+/// over budget naming its slowest listener.
+#[test]
+fn timing_types_read_the_slowest_first() {
+    use std::time::Duration;
+    let mut stats = TimingStats::new();
+    assert_eq!(stats.mean(), Duration::ZERO);
+    stats.count = 4;
+    stats.total = Duration::from_millis(10);
+    assert_eq!(stats.mean(), Duration::from_micros(2500));
+
+    let mut point = PointTimings::new("image.opened");
+    for (id, p95, max) in [("a", 1, 9), ("b", 3, 3), ("c", 1, 2)] {
+        let mut l = ListenerTimings::new(id);
+        l.stats.p95 = Duration::from_millis(p95);
+        l.stats.max = Duration::from_millis(max);
+        point.listeners.push(l);
+    }
+    let order: Vec<&str> = point.slowest().iter().map(|l| l.id.as_str()).collect();
+    assert_eq!(order, ["b", "a", "c"]);
+
+    let mut over = OverBudget::new(
+        "image.opened",
+        Duration::from_millis(7),
+        Duration::from_millis(4),
+    );
+    assert_eq!(over.slowest(), None);
+    over.listeners = vec![
+        ("marks".into(), Duration::from_millis(1)),
+        ("snapshots".into(), Duration::from_millis(6)),
+    ];
+    assert_eq!(
+        over.slowest(),
+        Some(("snapshots", Duration::from_millis(6)))
+    );
+    assert_eq!(
+        over.to_string(),
+        "hook `image.opened`: a pass took 7ms, over its budget of 4ms (slowest `snapshots`: 6ms)"
+    );
+}
+
+/// `on_over_budget` on `dyn Timings` goes through `add_budget_sink`.
+#[test]
+fn on_over_budget_adds_a_sink() {
+    #[derive(Default)]
+    struct Sinks(Mutex<Vec<bus_contract::BudgetSink>>);
+    impl Timings for Sinks {
+        fn points(&self) -> Vec<PointTimings> {
+            Vec::new()
+        }
+        fn point(&self, _: &str) -> Option<PointTimings> {
+            None
+        }
+        fn reset(&self) {}
+        fn add_budget_sink(&self, sink: bus_contract::BudgetSink) {
+            self.0.lock().unwrap().push(sink);
+        }
+    }
+    let sinks = Sinks::default();
+    let heard = Arc::new(AtomicU64::new(0));
+    let h = heard.clone();
+    (&sinks as &dyn Timings).on_over_budget(move |o| {
+        h.fetch_add(o.took.as_millis() as u64, Ordering::Relaxed);
+    });
+    let over = OverBudget::new(
+        "p",
+        std::time::Duration::from_millis(5),
+        std::time::Duration::from_millis(1),
+    );
+    for sink in sinks.0.lock().unwrap().iter() {
+        sink(&over);
+    }
+    assert_eq!(heard.load(Ordering::Relaxed), 5);
 }

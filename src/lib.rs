@@ -76,6 +76,9 @@ pub type FreshFn = fn() -> AnyValue;
 /// ([`Failure::dropped`]).
 pub type FailureSink = Arc<dyn Fn(&Failure) + Send + Sync>;
 
+/// Receives each pass over a point's budget ([`OverBudget`]).
+pub type BudgetSink = Arc<dyn Fn(&OverBudget) + Send + Sync>;
+
 /// The bus contract: hook points, their listeners in a declared order,
 /// emits and introspection. An application supplies one implementation
 /// (its own, or one written for it, such as `egui-pop-hooks`'s `Kernel`)
@@ -120,7 +123,8 @@ pub type FailureSink = Arc<dyn Fn(&Failure) + Send + Sync>;
 ///
 /// Capabilities: an implementation may offer more than this core, each
 /// as a trait of its own found at run time through a provided method
-/// that returns `None` by default ([`Bus::defer`]). A library that needs
+/// that returns `None` by default ([`Bus::defer`], [`Bus::timings`]). A
+/// library that needs
 /// one names it in its contract table ([`PointDecl::needs`]);
 /// [`declare_all`] then refuses the point on a bus without it
 /// ([`Refused::Unsupported`]). A library that can do without checks the
@@ -226,12 +230,68 @@ pub trait Bus: Send + Sync {
     fn defer(&self) -> Option<&dyn Defer> {
         None
     }
+
+    /// The [`Timings`] capability: how long listeners take, per point and
+    /// listener, and passes over a point's budget reported. `None` (the
+    /// default) when the implementation does not offer it.
+    fn timings(&self) -> Option<&dyn Timings> {
+        None
+    }
 }
 
 /// Whether `bus` offers `capability`.
 pub fn offers(bus: &dyn Bus, capability: Capability) -> bool {
     match capability {
         Capability::Defer => bus.defer().is_some(),
+        Capability::Timings => bus.timings().is_some(),
+    }
+}
+
+/// A capability of a bus ([`Bus::timings`]): how long listeners take,
+/// per point and per listener, and the passes over a point's budget
+/// ([`PointSpec::budget`]) reported as they happen.
+///
+/// A pass is what the listeners of one emit ran on one thread: the
+/// inline part of an alter or collect emit, one emit's local listeners
+/// run by [`Bus::run_pending`], or one ask run by [`Defer::drain`]. Its
+/// time is its listeners' times added up.
+///
+/// What an implementation promises:
+///
+/// - Every listener run it makes is timed, whatever its outcome (a
+///   threaded listener that misses its deadline counts the time the
+///   emit waited), and counted in the listener's and the pass's
+///   [`TimingStats`] until [`Timings::reset`].
+/// - A pass of a point with a budget that takes longer is reported to
+///   the budget sinks, on the thread that ran it, after the pass, with
+///   each listener's time ([`OverBudget`]). The pass's results are kept:
+///   a budget is not a deadline, and a pass over it is not a failure.
+/// - Quantiles may be approximate; counts, totals and maxima are exact.
+/// - Timing costs little next to a listener: clock reads and counters,
+///   no allocation per run.
+pub trait Timings: Send + Sync {
+    /// Every point that ran a pass since the last reset, in id order.
+    fn points(&self) -> Vec<PointTimings>;
+
+    /// The timings of the point `point`; `None` when it ran no pass
+    /// since the last reset.
+    fn point(&self, point: &str) -> Option<PointTimings>;
+
+    /// Starts a new window: every count back to zero (after a start-up
+    /// phase, before a measured run).
+    fn reset(&self);
+
+    /// Adds a sink called with each pass over its point's budget, on the
+    /// thread that ran it: where the host publishes its
+    /// [`OVER_BUDGET_FACT`] fact or logs. A sink that panics is ignored.
+    fn add_budget_sink(&self, sink: BudgetSink);
+}
+
+impl<'a> dyn Timings + 'a {
+    /// Adds a sink called with each pass over its point's budget
+    /// ([`Timings::add_budget_sink`]).
+    pub fn on_over_budget(&self, sink: impl Fn(&OverBudget) + Send + Sync + 'static) {
+        self.add_budget_sink(Arc::new(sink));
     }
 }
 
@@ -362,6 +422,10 @@ impl<B: Bus + ?Sized> Bus for Arc<B> {
 
     fn defer(&self) -> Option<&dyn Defer> {
         (**self).defer()
+    }
+
+    fn timings(&self) -> Option<&dyn Timings> {
+        (**self).timings()
     }
 }
 
@@ -556,6 +620,9 @@ pub struct PointDecl {
     /// The capabilities the point needs from the bus: [`declare_all`]
     /// refuses it on a bus without them.
     pub needs: &'static [Capability],
+    /// The time one pass of its listeners should take
+    /// ([`PointSpec::budget`]).
+    pub budget: Option<Duration>,
     key: fn() -> PointKey,
 }
 
@@ -569,6 +636,7 @@ impl PointDecl {
             deadline: None,
             fail_closed: false,
             needs: &[],
+            budget: None,
             key: PointKey::of::<P>,
         }
     }
@@ -593,6 +661,15 @@ impl PointDecl {
         self
     }
 
+    /// The time one pass of its listeners should take
+    /// ([`PointSpec::budget`]); reported when over, never failed. It
+    /// needs no capability: on a bus without [`Timings`] it is only
+    /// shown.
+    pub const fn budget(mut self, budget: Duration) -> PointDecl {
+        self.budget = Some(budget);
+        self
+    }
+
     /// The point's key.
     pub fn key(&self) -> PointKey {
         (self.key)()
@@ -603,6 +680,7 @@ impl PointDecl {
         let mut spec = PointSpec::new(self.description);
         spec.deadline = self.deadline;
         spec.fail_closed = self.fail_closed;
+        spec.budget = self.budget;
         spec
     }
 }

@@ -36,7 +36,9 @@ construction. There is no global.
   listener failure into a refusal.
 - **Optional capabilities**, found at run time: `Bus::defer()` returns
   the `Defer` capability (requests asked now, heard at the next drain on
-  the same thread) or `None`.
+  the same thread) or `None`; `Bus::timings()` returns the `Timings`
+  capability (per-point and per-listener times, passes over a point's
+  budget reported) or `None`.
 - **Typed calls on `dyn Bus`** (`declare::<P>`, `listen::<P>`,
   `listen_local::<P>`, `alter::<P>`, `collect::<P>`, `on_failure`,
   `on_pending`), written once over the erased methods: an
@@ -201,6 +203,37 @@ bus.defer().expect("declared with needs").ask::<LibraryWrite>(write, Vec::new())
 // after drawing, where nothing is borrowed:
 for run in bus.defer().map(|d| d.drain()).unwrap_or_default() {
     if let Some(refusal) = run.refused { log::warn!("{refusal}"); }
+}
+```
+
+### Timings
+
+`Bus::timings()` returns `Option<&dyn Timings>`: how long listeners
+take, per point and per listener (`TimingStats`: count, total, max,
+p50, p95), since the last `reset()`.
+
+- A pass is what one emit's listeners ran on one thread (an inline
+  emit, a `run_pending` run, a drained ask); its time is its listeners'
+  times added up.
+- A point may declare a budget for a pass (`PointDecl::budget`,
+  `PointSpec::budget`). A pass over it goes to the budget sinks
+  (`on_over_budget`, `OverBudget` with each listener's time), on the
+  thread that ran it. Nothing fails: a budget is not a deadline. A host
+  publishes it as the `bus.overBudget` fact (`OVER_BUDGET_FACT`) or logs.
+- A budget needs no capability: on a bus without `Timings` it is only
+  shown in introspection (`PointInfo::budget`).
+
+```rust,ignore
+pub const POINTS: &[PointDecl] = &[PointDecl::of::<ImageOpened>("An image was opened.")
+    .budget(Duration::from_millis(4))];
+
+if let Some(timings) = bus.timings() {
+    timings.on_over_budget(|over| log::warn!("{over}"));
+    for point in timings.points() {
+        for l in point.slowest().iter().take(3) {
+            println!("{} {} p95 {:?}", point.point, l.id, l.stats.p95);
+        }
+    }
 }
 ```
 

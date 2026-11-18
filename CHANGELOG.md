@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.3.1
+
+- The `Timings` capability: `Bus::timings()` (provided, `None` by
+  default) returns `Option<&dyn Timings>`: `points`, `point`, `reset`,
+  `add_budget_sink` (typed: `on_over_budget`). Per point and per
+  listener, `TimingStats` (count, total, max, p50, p95);
+  `PointTimings::slowest`.
+- Budgets: `PointDecl::budget` / `PointSpec::budget`, shown in
+  `PointInfo::budget`. A pass over its point's budget is reported as an
+  `OverBudget` (each listener's time, `slowest`), never failed;
+  `OVER_BUDGET_FACT` (`bus.overBudget`) names the fact a host publishes.
+- `Capability::Timings`; `BudgetSink`.
+
+Not breaking: the types gaining a field or variant are
+`#[non_exhaustive]` (`PointSpec`, `PointInfo`, `Capability`) or have a
+private field (`PointDecl`); an implementation of `Bus` needs no new
+method.
+
 ## 0.3.0
 
 - Refusals: a listener returns `HookError::Refuse` (`HookError::refuse`)
