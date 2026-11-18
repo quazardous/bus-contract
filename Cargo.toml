@@ -1,6 +1,6 @@
 [package]
 name = "bus-contract"
-version = "0.3.1"
+version = "0.3.2"
 description = "A contract for an in-process hook bus: libraries declare typed hook points and listen with named order (after, before, last), owners and deadlines; the application supplies the implementation and decides on one bus or several. No dependencies."
 readme = "README.md"
 keywords = ["event-bus", "hooks", "listeners", "plugins", "contract"]

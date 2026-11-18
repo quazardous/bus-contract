@@ -100,6 +100,14 @@ pub struct PointSpec {
     /// thread ([`Timings`](crate::Timings)): a pass over it is reported
     /// ([`OverBudget`]), never failed. `None`: no budget.
     pub budget: Option<Duration>,
+    /// On a [`PointKind::Event`] point, its events go through the bus's
+    /// journal ([`Journal`](crate::Journal)): published with a number,
+    /// delivered to the listeners in journal order after the publisher
+    /// has moved on.
+    pub journaled: bool,
+    /// On a journaled event point, how its input crosses a process
+    /// ([`Relay`](crate::Relay)); `None`: it stays in this one.
+    pub relay: Option<crate::Codec>,
 }
 
 impl PointSpec {
@@ -110,6 +118,8 @@ impl PointSpec {
             deadline: None,
             fail_closed: false,
             budget: None,
+            journaled: false,
+            relay: None,
         }
     }
 
@@ -129,6 +139,20 @@ impl PointSpec {
     /// ([`PointSpec::budget`]).
     pub fn budget(mut self, budget: Duration) -> PointSpec {
         self.budget = Some(budget);
+        self
+    }
+
+    /// Its events go through the journal ([`PointSpec::journaled`]).
+    pub fn journaled(mut self) -> PointSpec {
+        self.journaled = true;
+        self
+    }
+
+    /// Its events cross processes with `codec`; journaled too
+    /// ([`PointSpec::relay`]).
+    pub fn relayable(mut self, codec: crate::Codec) -> PointSpec {
+        self.journaled = true;
+        self.relay = Some(codec);
         self
     }
 }
@@ -428,6 +452,18 @@ pub enum Refused {
         /// The capability missing.
         capability: Capability,
     },
+    /// Only an event point is journaled or relayed
+    /// ([`PointSpec::journaled`]); it was not declared.
+    NotEvent {
+        /// The point.
+        point: &'static str,
+    },
+    /// An event was published through the journal on a point not
+    /// declared journaled on this bus; nothing was recorded.
+    NotJournaled {
+        /// The point.
+        point: &'static str,
+    },
 }
 
 impl fmt::Display for Refused {
@@ -456,6 +492,13 @@ impl fmt::Display for Refused {
                 "hook `{point}` needs the `{}` capability, which this bus does not offer",
                 capability.as_str()
             ),
+            Refused::NotEvent { point } => write!(
+                f,
+                "hook `{point}` is journaled or relayable but is not an event point"
+            ),
+            Refused::NotJournaled { point } => {
+                write!(f, "hook `{point}` is not declared journaled on this bus")
+            }
         }
     }
 }
@@ -475,6 +518,12 @@ pub enum Capability {
     /// How long listeners take, per point and listener, and passes over
     /// a point's budget reported ([`Timings`](crate::Timings)).
     Timings,
+    /// Events kept with a number, read again from one, delivered after
+    /// the publisher has moved on ([`Journal`](crate::Journal)).
+    Journal,
+    /// Events of relayable points served to another process and taken
+    /// in from one ([`Relay`](crate::Relay)); implies `Journal`.
+    Relay,
 }
 
 impl Capability {
@@ -483,6 +532,8 @@ impl Capability {
         match self {
             Capability::Defer => "defer",
             Capability::Timings => "timings",
+            Capability::Journal => "journal",
+            Capability::Relay => "relay",
         }
     }
 }
@@ -729,6 +780,11 @@ pub struct PointInfo {
     /// The time one pass of its listeners should take
     /// ([`PointSpec::budget`]).
     pub budget: Option<Duration>,
+    /// Whether its events go through the journal
+    /// ([`PointSpec::journaled`]).
+    pub journaled: bool,
+    /// Whether its events cross processes ([`PointSpec::relay`]).
+    pub relayable: bool,
     /// Its listeners, in the order they run.
     pub listeners: Vec<ListenerInfo>,
 }
@@ -745,6 +801,8 @@ impl PointInfo {
             deadline: DEFAULT_DEADLINE,
             fail_closed: false,
             budget: None,
+            journaled: false,
+            relayable: false,
             listeners: Vec::new(),
         }
     }
