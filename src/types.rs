@@ -21,6 +21,11 @@ pub const LAST: &str = "*";
 /// sinks receive ([`Bus::add_failure_sink`](crate::Bus::add_failure_sink)).
 pub const FAILED_FACT: &str = "hook.failed";
 
+/// The name a host gives the fact it publishes for each [`OverBudget`]
+/// its budget sinks receive
+/// ([`Timings::add_budget_sink`](crate::Timings::add_budget_sink)).
+pub const OVER_BUDGET_FACT: &str = "bus.overBudget";
+
 /// A hook point: one type per point, so its input and value are checked
 /// at compile time. Declared by the crate that owns the result.
 ///
@@ -91,6 +96,10 @@ pub struct PointSpec {
     /// having its contribution dropped: the emit stops there
     /// ([`Refusal::failed`]). Ignored on the other kinds.
     pub fail_closed: bool,
+    /// The time one pass of the point's listeners should take on a
+    /// thread ([`Timings`](crate::Timings)): a pass over it is reported
+    /// ([`OverBudget`]), never failed. `None`: no budget.
+    pub budget: Option<Duration>,
 }
 
 impl PointSpec {
@@ -100,6 +109,7 @@ impl PointSpec {
             description: description.into(),
             deadline: None,
             fail_closed: false,
+            budget: None,
         }
     }
 
@@ -112,6 +122,13 @@ impl PointSpec {
     /// A listener failure refuses the request ([`PointSpec::fail_closed`]).
     pub fn fail_closed(mut self) -> PointSpec {
         self.fail_closed = true;
+        self
+    }
+
+    /// The time one pass of the point's listeners should take
+    /// ([`PointSpec::budget`]).
+    pub fn budget(mut self, budget: Duration) -> PointSpec {
+        self.budget = Some(budget);
         self
     }
 }
@@ -455,6 +472,9 @@ pub enum Capability {
     /// Requests asked now and heard at the bus's next drain on the same
     /// thread ([`Defer`](crate::Defer)).
     Defer,
+    /// How long listeners take, per point and listener, and passes over
+    /// a point's budget reported ([`Timings`](crate::Timings)).
+    Timings,
 }
 
 impl Capability {
@@ -462,6 +482,7 @@ impl Capability {
     pub fn as_str(self) -> &'static str {
         match self {
             Capability::Defer => "defer",
+            Capability::Timings => "timings",
         }
     }
 }
@@ -705,6 +726,9 @@ pub struct PointInfo {
     /// Whether a listener failure refuses the request
     /// ([`PointSpec::fail_closed`]).
     pub fail_closed: bool,
+    /// The time one pass of its listeners should take
+    /// ([`PointSpec::budget`]).
+    pub budget: Option<Duration>,
     /// Its listeners, in the order they run.
     pub listeners: Vec<ListenerInfo>,
 }
@@ -720,7 +744,160 @@ impl PointInfo {
             declared: false,
             deadline: DEFAULT_DEADLINE,
             fail_closed: false,
+            budget: None,
             listeners: Vec::new(),
         }
+    }
+}
+
+/// How long something took over a window of runs
+/// ([`Timings`](crate::Timings)): a listener's runs, or a point's passes.
+/// The quantiles may be approximate (an implementation may read them
+/// from a histogram); the count, total and max are exact.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct TimingStats {
+    /// How many runs.
+    pub count: u64,
+    /// Their time added up.
+    pub total: Duration,
+    /// The longest.
+    pub max: Duration,
+    /// The median.
+    pub p50: Duration,
+    /// The 95th percentile.
+    pub p95: Duration,
+}
+
+impl TimingStats {
+    /// No run.
+    pub fn new() -> TimingStats {
+        TimingStats::default()
+    }
+
+    /// The mean time of a run; zero with no run.
+    pub fn mean(&self) -> Duration {
+        match u32::try_from(self.count) {
+            Ok(0) => Duration::ZERO,
+            Ok(n) => self.total / n,
+            Err(_) => Duration::from_secs_f64(self.total.as_secs_f64() / self.count as f64),
+        }
+    }
+}
+
+/// One listener's time on a point ([`PointTimings::listeners`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ListenerTimings {
+    /// Its id.
+    pub id: String,
+    /// Its owner.
+    pub owner: Option<String>,
+    /// Its runs.
+    pub stats: TimingStats,
+}
+
+impl ListenerTimings {
+    /// The listener `id`, no run.
+    pub fn new(id: impl Into<String>) -> ListenerTimings {
+        ListenerTimings {
+            id: id.into(),
+            owner: None,
+            stats: TimingStats::new(),
+        }
+    }
+}
+
+/// A point's time ([`Timings::points`](crate::Timings::points)): its
+/// passes, its listeners, its budget and how often a pass went over.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PointTimings {
+    /// The point.
+    pub point: &'static str,
+    /// Its budget ([`PointSpec::budget`]).
+    pub budget: Option<Duration>,
+    /// Its passes: each the time of the listeners one emit, queued run
+    /// or drained ask ran on one thread.
+    pub passes: TimingStats,
+    /// How many passes went over the budget.
+    pub over_budget: u64,
+    /// Its listeners that ran, in the order they run.
+    pub listeners: Vec<ListenerTimings>,
+}
+
+impl PointTimings {
+    /// The point `point`, no budget, no run.
+    pub fn new(point: &'static str) -> PointTimings {
+        PointTimings {
+            point,
+            budget: None,
+            passes: TimingStats::new(),
+            over_budget: 0,
+            listeners: Vec::new(),
+        }
+    }
+
+    /// Its listeners, the slowest first by their 95th percentile, then
+    /// by their max.
+    pub fn slowest(&self) -> Vec<&ListenerTimings> {
+        let mut out: Vec<&ListenerTimings> = self.listeners.iter().collect();
+        out.sort_by(|a, b| {
+            (b.stats.p95, b.stats.max)
+                .cmp(&(a.stats.p95, a.stats.max))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        out
+    }
+}
+
+/// A pass of a point's listeners that went over its budget
+/// ([`PointSpec::budget`]): reported to the budget sinks
+/// ([`Timings::add_budget_sink`](crate::Timings::add_budget_sink)). The
+/// pass's results were kept: a budget is not a deadline.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct OverBudget {
+    /// The point.
+    pub point: &'static str,
+    /// The pass's time: its listeners' times added up.
+    pub took: Duration,
+    /// The point's budget.
+    pub budget: Duration,
+    /// Each listener that ran in the pass, in order, with its time.
+    pub listeners: Vec<(String, Duration)>,
+}
+
+impl OverBudget {
+    /// A pass of `point` that took `took` against `budget`.
+    pub fn new(point: &'static str, took: Duration, budget: Duration) -> OverBudget {
+        OverBudget {
+            point,
+            took,
+            budget,
+            listeners: Vec::new(),
+        }
+    }
+
+    /// The listener that took longest in the pass, with its time.
+    pub fn slowest(&self) -> Option<(&str, Duration)> {
+        self.listeners
+            .iter()
+            .max_by_key(|(_, t)| *t)
+            .map(|(id, t)| (id.as_str(), *t))
+    }
+}
+
+impl fmt::Display for OverBudget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "hook `{}`: a pass took {:?}, over its budget of {:?}",
+            self.point, self.took, self.budget
+        )?;
+        if let Some((id, t)) = self.slowest() {
+            write!(f, " (slowest `{id}`: {t:?})")?;
+        }
+        Ok(())
     }
 }
