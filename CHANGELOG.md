@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- README: "Naming points". A point id starts with the declaring crate's
+  prefix (`<crate>.<subject>.<moment>`), so libraries sharing one bus
+  cannot collide.
+
 ## 0.3.2
 
 - The `Journal` capability: `Bus::journal()` (provided, `None` by
