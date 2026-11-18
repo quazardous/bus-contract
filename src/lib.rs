@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+mod journal;
 mod tools;
 mod types;
 
@@ -10,6 +11,10 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
+pub use journal::{
+    Codec, Cursor, DecodeFn, EncodeFn, IngestError, Journal, JournalEntry, Lost, Relay, Relayed,
+    RelayedEntry, Resumed, Since, kind_matches,
+};
 pub use tools::{declare_all, missing_targets, order_dump};
 pub use types::*;
 
@@ -123,8 +128,8 @@ pub type BudgetSink = Arc<dyn Fn(&OverBudget) + Send + Sync>;
 ///
 /// Capabilities: an implementation may offer more than this core, each
 /// as a trait of its own found at run time through a provided method
-/// that returns `None` by default ([`Bus::defer`], [`Bus::timings`]). A
-/// library that needs
+/// that returns `None` by default ([`Bus::defer`], [`Bus::timings`],
+/// [`Bus::journal`], [`Bus::relay`]). A library that needs
 /// one names it in its contract table ([`PointDecl::needs`]);
 /// [`declare_all`] then refuses the point on a bus without it
 /// ([`Refused::Unsupported`]). A library that can do without checks the
@@ -237,6 +242,22 @@ pub trait Bus: Send + Sync {
     fn timings(&self) -> Option<&dyn Timings> {
         None
     }
+
+    /// The [`Journal`] capability: events of journaled points kept with a
+    /// number, read again from one, delivered after the publisher has
+    /// moved on. `None` (the default) when the implementation does not
+    /// offer it.
+    fn journal(&self) -> Option<&dyn Journal> {
+        None
+    }
+
+    /// The [`Relay`] capability: events of relayable points served to
+    /// another process from a cursor, and taken in from one. `None` (the
+    /// default) when the implementation does not offer it; a bus that
+    /// offers it offers [`Bus::journal`].
+    fn relay(&self) -> Option<&dyn Relay> {
+        None
+    }
 }
 
 /// Whether `bus` offers `capability`.
@@ -244,6 +265,8 @@ pub fn offers(bus: &dyn Bus, capability: Capability) -> bool {
     match capability {
         Capability::Defer => bus.defer().is_some(),
         Capability::Timings => bus.timings().is_some(),
+        Capability::Journal => bus.journal().is_some(),
+        Capability::Relay => bus.relay().is_some() && bus.journal().is_some(),
     }
 }
 
@@ -426,6 +449,14 @@ impl<B: Bus + ?Sized> Bus for Arc<B> {
 
     fn timings(&self) -> Option<&dyn Timings> {
         (**self).timings()
+    }
+
+    fn journal(&self) -> Option<&dyn Journal> {
+        (**self).journal()
+    }
+
+    fn relay(&self) -> Option<&dyn Relay> {
+        (**self).relay()
     }
 }
 
@@ -623,6 +654,11 @@ pub struct PointDecl {
     /// The time one pass of its listeners should take
     /// ([`PointSpec::budget`]).
     pub budget: Option<Duration>,
+    /// Its events go through the bus's journal ([`PointSpec::journaled`]).
+    pub journaled: bool,
+    /// How its input crosses a process, when it is relayable
+    /// ([`PointSpec::relay`]).
+    pub relay: Option<Codec>,
     key: fn() -> PointKey,
 }
 
@@ -637,6 +673,8 @@ impl PointDecl {
             fail_closed: false,
             needs: &[],
             budget: None,
+            journaled: false,
+            relay: None,
             key: PointKey::of::<P>,
         }
     }
@@ -670,6 +708,42 @@ impl PointDecl {
         self
     }
 
+    /// Its events go through the bus's journal: published with a number,
+    /// delivered after the publisher has moved on ([`Journal`]). For an
+    /// event point; [`declare_all`] refuses it on a bus without the
+    /// journal ([`Refused::Unsupported`]) and on another kind
+    /// ([`Refused::NotEvent`]).
+    pub const fn journaled(mut self) -> PointDecl {
+        self.journaled = true;
+        self
+    }
+
+    /// Its events cross processes, their input written and read by
+    /// `codec` ([`Codec::of::<P>()`](Codec::of)); journaled too.
+    /// [`declare_all`] refuses it on a bus without the relay
+    /// ([`Refused::Unsupported`]), on another kind
+    /// ([`Refused::NotEvent`]), and with a codec of another point
+    /// ([`Refused::TypeMismatch`]).
+    pub const fn relayable(mut self, codec: Codec) -> PointDecl {
+        self.journaled = true;
+        self.relay = Some(codec);
+        self
+    }
+
+    /// The capabilities the point needs: those it names
+    /// ([`PointDecl::needs`]), then [`Capability::Journal`] when it is
+    /// journaled and [`Capability::Relay`] when it is relayable.
+    pub fn required(&self) -> Vec<Capability> {
+        let mut all = self.needs.to_vec();
+        if self.journaled && !all.contains(&Capability::Journal) {
+            all.push(Capability::Journal);
+        }
+        if self.relay.is_some() && !all.contains(&Capability::Relay) {
+            all.push(Capability::Relay);
+        }
+        all
+    }
+
     /// The point's key.
     pub fn key(&self) -> PointKey {
         (self.key)()
@@ -681,6 +755,8 @@ impl PointDecl {
         spec.deadline = self.deadline;
         spec.fail_closed = self.fail_closed;
         spec.budget = self.budget;
+        spec.journaled = self.journaled;
+        spec.relay = self.relay;
         spec
     }
 }

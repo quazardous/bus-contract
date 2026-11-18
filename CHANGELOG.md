@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.3.2
+
+- The `Journal` capability: `Bus::journal()` (provided, `None` by
+  default) returns `Option<&dyn Journal>`: `last_seq`, `since` (with
+  `Since::gap`), `wait` / typed `wait_for::<P>`, `publish_any` / typed
+  `publish::<P>` and `publish_caused::<P>`, `flush`. A journaled event
+  point's events are recorded with a number and delivered to its
+  listeners in number order, never on the publisher's thread.
+- The `Relay` capability: `Bus::relay()` returns `Option<&dyn Relay>`:
+  `cursor`, `resume` (`Resumed`, `Lost::Gap`, `Lost::Restarted`),
+  `ingest` (`IngestError`). `Cursor`, `RelayedEntry`, `JournalEntry`.
+- Contract tables: `PointDecl::journaled`, `PointDecl::relayable(codec)`,
+  `PointDecl::required`; `PointSpec::journaled` / `PointSpec::relay`;
+  `PointInfo::journaled` / `PointInfo::relayable`. `Relayed` and
+  `Codec::of::<P>()` write and read a relayable point's input as text.
+- `declare_all` refuses a journaled or relayable point on a bus without
+  the capability (`Refused::Unsupported`), on a point that is not an
+  event (`Refused::NotEvent`), and with another point's codec
+  (`Refused::TypeMismatch`). `Refused::NotJournaled` refuses a publish.
+- `Capability::Journal`, `Capability::Relay`; `kind_matches` reads the
+  event kind patterns every implementation shares (`vault.*`).
+- A design note: `docs/journal-and-relay.md`.
+
+Not breaking: the types gaining a field or variant are
+`#[non_exhaustive]` (`PointSpec`, `PointInfo`, `Refused`, `Capability`)
+or have a private field (`PointDecl`); an implementation of `Bus` needs
+no new method.
+
 ## 0.3.1
 
 - The `Timings` capability: `Bus::timings()` (provided, `None` by

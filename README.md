@@ -38,7 +38,11 @@ construction. There is no global.
   the `Defer` capability (requests asked now, heard at the next drain on
   the same thread) or `None`; `Bus::timings()` returns the `Timings`
   capability (per-point and per-listener times, passes over a point's
-  budget reported) or `None`.
+  budget reported) or `None`; `Bus::journal()` returns the `Journal`
+  capability (events with a number, read again from one, delivered
+  after the publisher has moved on); `Bus::relay()` returns the `Relay`
+  capability (events of relayable points served to another process and
+  taken in from one).
 - **Typed calls on `dyn Bus`** (`declare::<P>`, `listen::<P>`,
   `listen_local::<P>`, `alter::<P>`, `collect::<P>`, `on_failure`,
   `on_pending`), written once over the erased methods: an
@@ -237,10 +241,63 @@ if let Some(timings) = bus.timings() {
 }
 ```
 
+### Journal
+
+`Bus::journal()` returns `Option<&dyn Journal>`. An event point
+declared `journaled()` is published through the journal instead of
+emitted: the publisher gets a number and moves on, and the listeners
+hear each event once, in number order, on a thread of the
+implementation's (a pump). A slow listener delays the next events, not
+the publisher.
+
+- `publish::<P>(input)` / `publish_caused::<P>(input, cause)`: the
+  entry's number, from 1. Refused on a point not declared journaled.
+- `since(seq, limit)`: the entries after a number, with `gap` set when
+  some left the journal's window; `last_seq()`.
+- `wait(patterns, seq, timeout)` / `wait_for::<P>`: the next entry of a
+  kind (`vault.*`, see `kind_matches`), at once if already there.
+- `flush(timeout)`: every entry recorded so far delivered (before an
+  exit, in tests).
+
+### Relay
+
+`Bus::relay()` returns `Option<&dyn Relay>`, on a bus that offers the
+journal. An event point declared `relayable(Codec::of::<P>())` has its
+input written as text and read back by another process (`Relayed`: the
+format is the application's). The transport is the application's too.
+
+- `cursor()`: where a reader starting now stands (the journal's run and
+  last number). `resume(cursor, limit)`: the relayable entries after
+  it, and `lost` when the reader missed some (`Gap`: the window;
+  `Restarted`: the process started again and numbers with it). A
+  reader that lost entries resyncs, then applies the ones returned.
+- `ingest(source, entry)`: an entry relayed in is recorded with its
+  source and delivered to its point's listeners like a local one. A
+  kind not declared here is kept as text and heard by no one; a point
+  declared here but not relayable is refused. Entries taken in are not
+  served again.
+
+```rust,ignore
+pub const POINTS: &[PointDecl] = &[
+    PointDecl::of::<LibraryImported>("Photos were imported.")
+        .relayable(Codec::of::<LibraryImported>()),
+    PointDecl::of::<StepComputed>("A render step was computed.").journaled(),
+];
+
+// the node publishes and moves on:
+bus.journal().expect("declared journaled").publish::<LibraryImported>(imported)?;
+// its server answers a desktop reader:
+let read = bus.relay().expect("declared relayable").resume(cursor, 256);
+// the desktop takes the entries in; its listeners hear them in order:
+for entry in read.entries { desktop.relay().unwrap().ingest("node", entry)?; }
+```
+
+Why it is shaped this way: [docs/journal-and-relay.md](https://github.com/quazardous/bus-contract/blob/main/docs/journal-and-relay.md).
+
 ## Not included
 
-- A journal (events with a revision, catch-up from a revision).
-- Transport across processes.
+- Transport across processes: a relay reads and takes entries, the
+  application moves them.
 
 ## License
 

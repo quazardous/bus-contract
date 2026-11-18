@@ -2,18 +2,31 @@
 //! library's table, the order dump and the missing targets a test ends
 //! without.
 
-use crate::{Bus, LAST, PointDecl, Refused, offers};
+use crate::{Bus, LAST, PointDecl, PointKind, Refused, offers};
 
 /// Declares every point of a library's contract table on `bus`; the
-/// refusals, in table order: a point already declared (another library,
-/// or a second application on the same bus), or a point that needs a
-/// capability the bus does not offer ([`Refused::Unsupported`], the
-/// point left undeclared).
+/// refusals, in table order, each point refused left undeclared:
+///
+/// - a point already declared (another library, or a second application
+///   on the same bus);
+/// - a point that needs a capability the bus does not offer
+///   ([`Refused::Unsupported`]): those it names, the journal for a
+///   journaled point, the relay for a relayable one
+///   ([`PointDecl::required`]);
+/// - a journaled or relayable point that is not an event
+///   ([`Refused::NotEvent`]), or relayable with another point's codec
+///   ([`Refused::TypeMismatch`]).
 pub fn declare_all(bus: &dyn Bus, table: &[PointDecl]) -> Vec<Refused> {
     table
         .iter()
         .filter_map(|d| {
-            if let Some(&capability) = d.needs.iter().find(|c| !offers(bus, **c)) {
+            if d.journaled && d.kind != PointKind::Event {
+                return Some(Refused::NotEvent { point: d.id });
+            }
+            if d.relay.is_some_and(|c| c.point != d.id) {
+                return Some(Refused::TypeMismatch { point: d.id });
+            }
+            if let Some(capability) = d.required().into_iter().find(|c| !offers(bus, *c)) {
                 return Some(Refused::Unsupported {
                     point: d.id,
                     capability,
