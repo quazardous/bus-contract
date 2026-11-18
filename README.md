@@ -105,6 +105,27 @@ let search = Search::new(bus.clone());
 print!("{}", bus_contract::order_dump(&*bus, &["doc.close"]));
 ```
 
+## Naming points
+
+Several libraries share one bus, so a point's id starts with a prefix
+that names the crate declaring it, then the subject and the moment:
+`<crate>.<subject>.<moment>`.
+
+- A library uses one short prefix of its own, written in its docs:
+  `stack.layout.changed`, `stack.window.closed` for a docking crate
+  called `egui_stack`; `doc.close` for the example above.
+- An event names what happened, in the past (`…changed`, `…closed`).
+  A request names what is asked (`…close`, `…drop`).
+- A library never declares a point under another crate's prefix, and
+  never asks another crate to rename its points to free a bare name.
+- Listener ids follow the same rule (`docs.autosave`), so the
+  `order_dump` of a point shows who each listener belongs to.
+
+Two libraries that keep to this cannot collide, whatever the
+application puts on its bus. A clash is refused at declaration time
+(`Refused::TypeMismatch`): a point id is registered with one `Point`
+type.
+
 ## Local listeners
 
 A listener registered with `listen_local::<P>` may hold state that is
