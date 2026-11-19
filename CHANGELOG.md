@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.4.2
+
+Docs only: no change to the traits or their behaviour.
+
+- `GUARANTEES.md`, also in the crate docs as the `guarantees` module and
+  summarised in the README: for each contract (core, defer, timings,
+  journal, crossing), every property with a stable id
+  (`core.order.declared`, `core.request.veto-stops`,
+  `crossing.deadline.fail-closed`, …), what is guaranteed, what is not,
+  and the `bus-kernel` conformance check that proves it, or "not covered
+  yet".
+- Stated explicitly: a refusal never rolls back earlier listeners'
+  effects; requests are fail-open unless declared `fail_closed`;
+  `PointKind` is not purely declarative (`Request` changes semantics,
+  `Event` gates the journal); crossing is not a distributed transaction;
+  authorities are not a security boundary; no persistence or
+  exactly-once across processes.
+- Credits: the guarantees-page style and its "what we do not guarantee"
+  framing come from
+  [eventbus-contract](https://github.com/mapseekai/eventbus-contract)
+  and [qubit-event-bus](https://github.com/qubit-ltd/rs-event-bus).
+
 ## 0.4.1
 
 - Docs: the reference implementation is `bus-kernel`'s `Kernel` (it
