@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.3
+
+Docs only: no change to the traits or their behaviour.
+
+- `GUARANTEES.md`: the rows that were "not covered yet" name the
+  `bus-kernel` 0.2.1 checks that now prove them: the panicking waker,
+  failure sink and budget sink, the order of queued emits, listening on
+  the emitting point, the defer wakers and a listener removed between
+  ask and drain, the refusal that keeps earlier effects, journal numbers
+  growing by one, the `since` gap, `wait` / `wait_for` and the cause,
+  `Lost::Gap` and `Lost::Restarted`, no echo, and relay implying
+  journal. Only local listeners queued from the journal's pump are
+  still not covered.
+
 ## 0.4.2
 
 Docs only: no change to the traits or their behaviour.
