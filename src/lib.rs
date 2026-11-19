@@ -12,8 +12,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub use journal::{
-    Codec, Cursor, DecodeFn, EncodeFn, IngestError, Journal, JournalEntry, Lost, Relay, Relayed,
-    RelayedEntry, Resumed, Since, kind_matches,
+    Answer, Authority, Codec, Crossing, Cursor, DecodeFn, DecodeValueFn, EncodeFn, EncodeValueFn,
+    IngestError, Journal, JournalEntry, Lost, Origin, Relay, Relayed, RelayedAnswer, RelayedAsk,
+    RelayedEntry, RelayedRequest, Resumed, Since, ask_run, far_listener, kind_matches,
 };
 pub use tools::{declare_all, missing_targets, order_dump};
 pub use types::*;
@@ -252,9 +253,10 @@ pub trait Bus: Send + Sync {
     }
 
     /// The [`Relay`] capability: events of relayable points served to
-    /// another process from a cursor, and taken in from one. `None` (the
-    /// default) when the implementation does not offer it; a bus that
-    /// offers it offers [`Bus::journal`].
+    /// another process from a cursor and taken in from one, asks of
+    /// relayable requests answered for one. `None` (the default) when
+    /// the implementation does not offer it; a bus that offers it offers
+    /// [`Bus::journal`].
     fn relay(&self) -> Option<&dyn Relay> {
         None
     }
@@ -656,9 +658,11 @@ pub struct PointDecl {
     pub budget: Option<Duration>,
     /// Its events go through the bus's journal ([`PointSpec::journaled`]).
     pub journaled: bool,
-    /// How its input crosses a process, when it is relayable
+    /// How it crosses a process, when it is relayable
     /// ([`PointSpec::relay`]).
     pub relay: Option<Codec>,
+    /// Its version, from 1 ([`PointSpec::version`]).
+    pub version: u32,
     key: fn() -> PointKey,
 }
 
@@ -675,6 +679,7 @@ impl PointDecl {
             budget: None,
             journaled: false,
             relay: None,
+            version: 1,
             key: PointKey::of::<P>,
         }
     }
@@ -718,15 +723,34 @@ impl PointDecl {
         self
     }
 
-    /// Its events cross processes, their input written and read by
-    /// `codec` ([`Codec::of::<P>()`](Codec::of)); journaled too.
+    /// The point crosses processes ([`Relay`]):
+    ///
+    /// - an event point's events, their input written and read by
+    ///   `codec` ([`Codec::of::<P>()`](Codec::of)); journaled too;
+    /// - a request point's asks, from another process, their input and
+    ///   value written and read by `codec`
+    ///   ([`Codec::request::<P>()`](Codec::request)); fail-closed too, so
+    ///   no answer in time is a refusal.
+    ///
     /// [`declare_all`] refuses it on a bus without the relay
-    /// ([`Refused::Unsupported`]), on another kind
-    /// ([`Refused::NotEvent`]), and with a codec of another point
-    /// ([`Refused::TypeMismatch`]).
+    /// ([`Refused::Unsupported`]), on an alter or collect point and on a
+    /// request whose codec has no value ([`Refused::NotCrossable`]), and
+    /// with a codec of another point ([`Refused::TypeMismatch`]).
     pub const fn relayable(mut self, codec: Codec) -> PointDecl {
-        self.journaled = true;
+        match self.kind {
+            PointKind::Event => self.journaled = true,
+            PointKind::Request => self.fail_closed = true,
+            _ => {}
+        }
         self.relay = Some(codec);
+        self
+    }
+
+    /// Its version, from 1 ([`PointSpec::version`]): raise it when the
+    /// payload changes in a way an older reader cannot use. Two
+    /// processes cross the point only at the same version.
+    pub const fn version(mut self, version: u32) -> PointDecl {
+        self.version = version;
         self
     }
 
@@ -757,6 +781,7 @@ impl PointDecl {
         spec.budget = self.budget;
         spec.journaled = self.journaled;
         spec.relay = self.relay;
+        spec.version = self.version;
         spec
     }
 }

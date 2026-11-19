@@ -56,8 +56,28 @@ A kind the receiver does not declare is kept as text, delivered to no
 one, readable with `since`. A point declared on the receiver but not
 relayable is refused: a remote process may not publish it.
 
-**No transport.** A relay reads (`resume`) and takes in (`ingest`); the
-application moves entries over its own socket or RPC.
+**No transport.** A relay reads (`resume`), takes in (`ingest`) and
+answers (`answer`); a bridge moves the text over its own socket or RPC.
+
+**Requests cross as asks (0.4).** A journal cannot carry a request: its
+caller waits for a value. A relayable request instead crosses as an
+ask answered by the far side's `Relay::answer`, and on the asking side
+the far side is one listener (`far_listener`) in the point's order. The
+contract fixes what a bridge may not choose: the ask carries a
+deadline, no answer in time is a refusal (the point is fail-closed), a
+veto carries its reason, and each ask is run once per origin. Without
+it, each transport would give timeouts and vetoes its own meaning and
+one bus would quietly become several.
+
+**Origin and authority (0.4).** The receiver names the origin from the
+link, never from the payload, so a sender cannot claim another one.
+Authorities see each crossing before it is decoded: a refused one
+leaves no trace but the refusal.
+
+**Versions (0.4).** Decoders already accept unknown fields, which
+covers additive changes. A version on the point covers the rest: the
+same version on both sides, or the crossing is refused, rather than
+read wrongly.
 
 ## Not decided here
 
@@ -66,3 +86,6 @@ application moves entries over its own socket or RPC.
   text, which is enough to read and relay them by hand.
 - Back-pressure on the pump (a bounded queue, dropping, or blocking the
   publisher past a size): left to implementations for now.
+- Reading an older version of a point (a range of versions a codec
+  reads): additive later; for now the versions must be equal.
+- Point aliases (a point renamed across versions).

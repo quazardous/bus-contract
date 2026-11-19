@@ -13,8 +13,10 @@ use crate::{Bus, LAST, PointDecl, PointKind, Refused, offers};
 ///   ([`Refused::Unsupported`]): those it names, the journal for a
 ///   journaled point, the relay for a relayable one
 ///   ([`PointDecl::required`]);
-/// - a journaled or relayable point that is not an event
-///   ([`Refused::NotEvent`]), or relayable with another point's codec
+/// - a journaled point that is not an event ([`Refused::NotEvent`]);
+/// - a relayable point that cannot cross: an alter or collect point, a
+///   request whose codec writes no value ([`Refused::NotCrossable`]);
+/// - a relayable point with another point's codec
 ///   ([`Refused::TypeMismatch`]).
 pub fn declare_all(bus: &dyn Bus, table: &[PointDecl]) -> Vec<Refused> {
     table
@@ -23,8 +25,18 @@ pub fn declare_all(bus: &dyn Bus, table: &[PointDecl]) -> Vec<Refused> {
             if d.journaled && d.kind != PointKind::Event {
                 return Some(Refused::NotEvent { point: d.id });
             }
-            if d.relay.is_some_and(|c| c.point != d.id) {
-                return Some(Refused::TypeMismatch { point: d.id });
+            if let Some(codec) = d.relay {
+                if codec.point != d.id {
+                    return Some(Refused::TypeMismatch { point: d.id });
+                }
+                let crosses = match d.kind {
+                    PointKind::Event => true,
+                    PointKind::Request => codec.answers(),
+                    _ => false,
+                };
+                if !crosses {
+                    return Some(Refused::NotCrossable { point: d.id });
+                }
             }
             if let Some(capability) = d.required().into_iter().find(|c| !offers(bus, *c)) {
                 return Some(Refused::Unsupported {
