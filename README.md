@@ -61,6 +61,29 @@ This crate has no implementation. The reference one is `Kernel` in
 `conformance` feature checks any implementation against the guarantees
 documented on `Bus`.
 
+## Guarantees
+
+[GUARANTEES.md](https://github.com/quazardous/bus-contract/blob/main/GUARANTEES.md)
+(also the `guarantees` page of the crate docs) lists, contract by
+contract (core, defer, timings, journal, crossing), each property with a
+stable id such as `core.order.declared`, `core.request.veto-stops` or
+`crossing.deadline.fail-closed`: what is guaranteed, what is not, and
+the `bus-kernel` conformance check that proves it. In short:
+
+- listeners run in their declared order; a failing listener is
+  isolated, its edit dropped, the failure returned;
+- a veto stops a request, but **never rolls back** what the listeners
+  before it did;
+- requests are fail-open unless declared `fail_closed` (relayable
+  requests always are); `PointKind` is not only a label: `Request`
+  enables refusals, `Event` gates the journal;
+- crossing is **not a distributed transaction**: both sides agree on
+  the outcome, effects made before a deadline stay, so listeners of
+  relayable requests should be idempotent;
+- authorities guard a trusted process against mistakes, not against an
+  attacker; the journal is a window in memory, with no persistence and
+  no exactly-once across processes.
+
 ## Example
 
 ```rust

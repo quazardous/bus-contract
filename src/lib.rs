@@ -6,6 +6,12 @@ mod journal;
 mod tools;
 mod types;
 
+/// What an implementation guarantees and what it does not, contract by
+/// contract, each property with a stable id and the conformance check
+/// that proves it. Documentation only: this module has no items.
+#[doc = include_str!("../GUARANTEES.md")]
+pub mod guarantees {}
+
 use std::any::{Any, TypeId, type_name};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -110,6 +116,9 @@ pub type BudgetSink = Arc<dyn Fn(&OverBudget) + Send + Sync>;
 /// - The value an emit returns is of the point's type: the typed calls
 ///   panic otherwise, as a defect of the implementation.
 /// - Listeners run with no lock held, so a listener may emit or listen.
+///
+/// Every property, with its stable id, what it does not guarantee and
+/// the check that proves it: [`guarantees`].
 ///
 /// Refusals, on a point declared [`PointKind::Request`]:
 ///
