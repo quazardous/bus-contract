@@ -1,5 +1,62 @@
 # Changelog
 
+## 0.4.0 (unreleased)
+
+Crossing: what may cross a process boundary and what it means. The
+transport stays out of the contract.
+
+- Requests cross: `PointDecl::relayable` takes a request point with a
+  request codec (`Codec::request::<P>()`, the `RelayedRequest` trait:
+  the value written and read too) and makes it fail-closed;
+  `PointSpec::relayable_request`. Alter and collect points never cross
+  (`Refused::NotCrossable`).
+- `Relay::answer(origin, ask)`: an ask (`RelayedAsk`: run, number,
+  kind, version, deadline, input and value as text) answered by the far
+  side's listeners (`RelayedAnswer`, `Answer::Done` / `Answer::Refused`
+  with the far listener and its reason). Fail-closed on the deadline on
+  both sides; answered once per origin.
+- `far_listener(codec, deadline, version, send)`: the asking side's
+  listener standing for the far side; no answer in time, a late answer,
+  an answer to another ask or one it cannot read refuses. `ask_run()`.
+- `Origin` (process, agent): set by the receiver from the link.
+  `JournalEntry::origin`.
+- Authority: `Relay::add_authority` (typed `authorize`), `Authority`,
+  `Crossing`; checked before anything crossing in is decoded, recorded
+  or run. `IngestError::Refused`.
+- Point versions: `PointDecl::version`, `PointSpec::version`,
+  `PointInfo::version`, `RelayedEntry::version`;
+  `IngestError::Version`.
+- `PointInfo::relayable` is set on relayable requests too.
+
+Breaking, and why:
+
+- `Relay::ingest` takes `&Origin` instead of `&str`: the origin is
+  structured (process and agent) so an authority can decide on it.
+- `JournalEntry::source: Option<String>` becomes
+  `JournalEntry::origin: Option<Origin>`, for the same reason.
+- `Relay` has two new required methods, `answer` and `add_authority`:
+  a default would either drop the authority (fail-open) or refuse every
+  ask silently.
+- `Codec` gains fields (`encode_value`, `decode_value`, `clone_value`)
+  and is now `#[non_exhaustive]`: build it with `Codec::of` or
+  `Codec::request`.
+- `PointDecl::relayable` on a request point used to be refused
+  (`Refused::NotEvent`, since it also made the point journaled); it now
+  declares a crossing request (fail-closed, not journaled), or is
+  refused as `Refused::NotCrossable` with an event codec. On an alter or
+  collect point, `Refused::NotEvent` becomes `Refused::NotCrossable`.
+
+Migration from 0.3:
+
+- `relay.ingest("node", entry)` becomes
+  `relay.ingest(&Origin::process("node"), entry)`; `entry.source`
+  becomes `entry.origin` (`.process` holds the old string).
+- An implementation of `Relay` adds `answer` (see the promises on
+  `Relay`) and `add_authority`, checks authorities in `ingest`, refuses
+  an entry at another version, and fills `RelayedEntry::version` in
+  `resume`. Its `declare_point` accepts a relayable request and refuses
+  `NotCrossable` points.
+
 ## 0.3.3
 
 - Docs: point ids start with the declaring crate's prefix,

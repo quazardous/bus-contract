@@ -105,9 +105,17 @@ pub struct PointSpec {
     /// delivered to the listeners in journal order after the publisher
     /// has moved on.
     pub journaled: bool,
-    /// On a journaled event point, how its input crosses a process
-    /// ([`Relay`](crate::Relay)); `None`: it stays in this one.
+    /// How the point crosses a process ([`Relay`](crate::Relay)): on a
+    /// journaled event point, how its input is written; on a request
+    /// point, its input and value ([`Codec::request`](crate::Codec::request)),
+    /// so another process may ask it ([`Relay::answer`](crate::Relay::answer)).
+    /// `None`: it stays in this one.
     pub relay: Option<crate::Codec>,
+    /// The point's version, from 1: raised when its payload changes in a
+    /// way an older reader cannot use (a field it may ignore is not such
+    /// a change). Two processes cross a point only at the same version
+    /// ([`IngestError::Version`](crate::IngestError::Version)).
+    pub version: u32,
 }
 
 impl PointSpec {
@@ -120,6 +128,7 @@ impl PointSpec {
             budget: None,
             journaled: false,
             relay: None,
+            version: 1,
         }
     }
 
@@ -149,10 +158,26 @@ impl PointSpec {
     }
 
     /// Its events cross processes with `codec`; journaled too
-    /// ([`PointSpec::relay`]).
+    /// ([`PointSpec::relay`]). For an event point: a request uses
+    /// [`PointSpec::relayable_request`].
     pub fn relayable(mut self, codec: crate::Codec) -> PointSpec {
         self.journaled = true;
         self.relay = Some(codec);
+        self
+    }
+
+    /// Another process may ask this request, its input and value written
+    /// by `codec` ([`Codec::request`](crate::Codec::request)); fail-closed
+    /// too, so no answer in time is a refusal ([`PointSpec::relay`]).
+    pub fn relayable_request(mut self, codec: crate::Codec) -> PointSpec {
+        self.fail_closed = true;
+        self.relay = Some(codec);
+        self
+    }
+
+    /// The point's version ([`PointSpec::version`]).
+    pub fn version(mut self, version: u32) -> PointSpec {
+        self.version = version;
         self
     }
 }
@@ -464,6 +489,14 @@ pub enum Refused {
         /// The point.
         point: &'static str,
     },
+    /// The point is relayable but cannot cross: only an event point, or
+    /// a request point whose codec writes its value too
+    /// ([`Codec::request`](crate::Codec::request)), crosses a process. It
+    /// was not declared.
+    NotCrossable {
+        /// The point.
+        point: &'static str,
+    },
 }
 
 impl fmt::Display for Refused {
@@ -499,6 +532,10 @@ impl fmt::Display for Refused {
             Refused::NotJournaled { point } => {
                 write!(f, "hook `{point}` is not declared journaled on this bus")
             }
+            Refused::NotCrossable { point } => write!(
+                f,
+                "hook `{point}` is relayable but cannot cross: only an event, or a request with a value codec, crosses"
+            ),
         }
     }
 }
@@ -522,7 +559,8 @@ pub enum Capability {
     /// the publisher has moved on ([`Journal`](crate::Journal)).
     Journal,
     /// Events of relayable points served to another process and taken
-    /// in from one ([`Relay`](crate::Relay)); implies `Journal`.
+    /// in from one, asks of relayable requests answered for one
+    /// ([`Relay`](crate::Relay)); implies `Journal`.
     Relay,
 }
 
@@ -783,8 +821,11 @@ pub struct PointInfo {
     /// Whether its events go through the journal
     /// ([`PointSpec::journaled`]).
     pub journaled: bool,
-    /// Whether its events cross processes ([`PointSpec::relay`]).
+    /// Whether it crosses processes ([`PointSpec::relay`]): its events,
+    /// or, on a request, asks from another process.
     pub relayable: bool,
+    /// Its version ([`PointSpec::version`]).
+    pub version: u32,
     /// Its listeners, in the order they run.
     pub listeners: Vec<ListenerInfo>,
 }
@@ -803,6 +844,7 @@ impl PointInfo {
             budget: None,
             journaled: false,
             relayable: false,
+            version: 1,
             listeners: Vec::new(),
         }
     }

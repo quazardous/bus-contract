@@ -1,7 +1,8 @@
 //! The `Journal` and `Relay` capabilities over a reference in-memory
 //! implementation written against the contract alone: shared listeners
 //! in registration order, no deadlines, no local listeners; a journal
-//! with a window and a pump thread that delivers its entries in order.
+//! with a window and a pump thread that delivers its entries in order;
+//! asks answered for another process, behind authorities.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -9,12 +10,15 @@ use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::{self, ThreadId};
 use std::time::{Duration, Instant};
 
+use std::panic::{AssertUnwindSafe, catch_unwind};
+
 use bus_contract::{
-    Altered, AnyInput, AnyListener, AnyLocalListener, AnyValue, Bus, Capability, CloneFn, Codec,
-    Collected, Cursor, Failure, FailureKind, FailureSink, FreshFn, IngestError, Journal,
-    JournalEntry, ListenOpts, ListenerInfo, Lost, PendingRun, PendingWaker, Point, PointDecl,
-    PointInfo, PointKey, PointKind, PointSpec, Refused, Relay, Relayed, RelayedEntry, Resumed,
-    Since, declare_all, kind_matches, offers,
+    Altered, Answer, AnyInput, AnyListener, AnyLocalListener, AnyValue, Authority, Bus, Capability,
+    CloneFn, Codec, Collected, Crossing, Cursor, Failure, FailureKind, FailureSink, FreshFn,
+    HookError, IngestError, Journal, JournalEntry, ListenOpts, ListenerInfo, Lost, Origin,
+    PendingRun, PendingWaker, Point, PointDecl, PointInfo, PointKey, PointKind, PointSpec, Refusal,
+    Refused, Relay, Relayed, RelayedAnswer, RelayedAsk, RelayedEntry, RelayedRequest, Resumed,
+    Since, declare_all, far_listener, kind_matches, offers,
 };
 
 /// Each bus a run of its own, as a process restart would give.
@@ -35,10 +39,15 @@ struct Log {
     queue: VecDeque<Queued>,
 }
 
+/// An ask answered: who asked (process, run, number).
+type AskKey = (String, u64, u64);
+
 struct Inner {
     points: Mutex<HashMap<&'static str, (PointKey, PointSpec)>>,
     listeners: Mutex<Vec<(&'static str, String, ListenOpts, AnyListener)>>,
     sinks: Mutex<Vec<FailureSink>>,
+    authorities: Mutex<Vec<Authority>>,
+    answered: Mutex<HashMap<AskKey, RelayedAnswer>>,
     log: Mutex<Log>,
     changed: Condvar,
     run: u64,
@@ -46,6 +55,74 @@ struct Inner {
 }
 
 impl Inner {
+    fn of_point(&self, point: &str) -> Vec<(String, Option<String>, AnyListener)> {
+        self.listeners
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| l.0 == point)
+            .map(|l| (l.1.clone(), l.2.owner.clone(), l.3.clone()))
+            .collect()
+    }
+
+    fn fail(&self, f: &Failure) {
+        for sink in self.sinks.lock().unwrap().iter() {
+            sink(f);
+        }
+    }
+
+    /// An alter emit with refusals and fail-closed requests.
+    fn alter(
+        &self,
+        point: PointKey,
+        input: AnyInput,
+        value: AnyValue,
+        clone: CloneFn,
+    ) -> Altered<AnyValue> {
+        let request = point.kind == PointKind::Request;
+        let fail_closed = request
+            && self
+                .spec(point.id)
+                .is_some_and(|(_, spec)| spec.fail_closed);
+        let mut out = Altered::new(value);
+        for (id, owner, run) in self.of_point(point.id) {
+            let before = clone(&*out.value);
+            match run(&*input, &mut *out.value) {
+                Ok(()) => {}
+                Err(HookError::Refuse(reason)) if request => {
+                    out.value = before;
+                    out.refused = Some(Refusal::new(point.id, id, owner, reason));
+                    break;
+                }
+                Err(e) => {
+                    out.value = before;
+                    let f = Failure::new(point.id, id, owner, FailureKind::Error(e.to_string()));
+                    self.fail(&f);
+                    if fail_closed {
+                        out.refused = Some(Refusal::from_failure(&f));
+                        out.failures.push(f);
+                        break;
+                    }
+                    out.failures.push(f);
+                }
+            }
+        }
+        out
+    }
+
+    /// Every authority, in order; a panic refuses.
+    fn authorize(&self, crossing: &Crossing<'_>) -> Result<(), String> {
+        let all = self.authorities.lock().unwrap().clone();
+        for authority in all {
+            match catch_unwind(AssertUnwindSafe(|| authority(crossing))) {
+                Ok(Ok(())) => {}
+                Ok(Err(reason)) => return Err(reason),
+                Err(_) => return Err("an authority panicked".into()),
+            }
+        }
+        Ok(())
+    }
+
     fn collect(&self, point: PointKey, input: AnyInput, fresh: FreshFn) -> Collected<AnyValue> {
         let listeners: Vec<(String, Option<String>, AnyListener)> = self
             .listeners
@@ -132,6 +209,8 @@ impl Memory {
             points: Mutex::default(),
             listeners: Mutex::default(),
             sinks: Mutex::default(),
+            authorities: Mutex::default(),
+            answered: Mutex::default(),
             log: Mutex::default(),
             changed: Condvar::new(),
             run: NEXT_RUN.fetch_add(1, Ordering::Relaxed),
@@ -157,6 +236,16 @@ impl Bus for Memory {
     fn declare_point(&self, point: PointKey, spec: PointSpec) -> Result<(), Refused> {
         if spec.journaled && point.kind != PointKind::Event {
             return Err(Refused::NotEvent { point: point.id });
+        }
+        if let Some(codec) = spec.relay {
+            let crosses = match point.kind {
+                PointKind::Event => true,
+                PointKind::Request => codec.answers(),
+                _ => false,
+            };
+            if !crosses {
+                return Err(Refused::NotCrossable { point: point.id });
+            }
         }
         let mut points = self.inner.points.lock().unwrap();
         if points.contains_key(point.id) {
@@ -213,12 +302,12 @@ impl Bus for Memory {
 
     fn alter_any(
         &self,
-        _: PointKey,
-        _: AnyInput,
+        point: PointKey,
+        input: AnyInput,
         value: AnyValue,
-        _: CloneFn,
+        clone: CloneFn,
     ) -> Altered<AnyValue> {
-        Altered::new(value)
+        self.inner.alter(point, input, value, clone)
     }
 
     fn collect_any(&self, point: PointKey, input: AnyInput, fresh: FreshFn) -> Collected<AnyValue> {
@@ -242,6 +331,8 @@ impl Bus for Memory {
                 info.declared = true;
                 info.journaled = s.journaled;
                 info.relayable = s.relay.is_some();
+                info.version = s.version;
+                info.fail_closed = s.fail_closed;
                 info.listeners = self.listeners(k.id).unwrap_or_default();
                 info
             })
@@ -369,7 +460,7 @@ impl Relay for Memory {
             let Some((_, spec)) = self.inner.spec(&e.kind) else {
                 continue;
             };
-            let (Some(codec), None, Some(input)) = (spec.relay, &e.source, &e.input) else {
+            let (Some(codec), None, Some(input)) = (spec.relay, &e.origin, &e.input) else {
                 continue;
             };
             let Some(text) = (codec.encode)(&**input) else {
@@ -377,6 +468,7 @@ impl Relay for Memory {
             };
             let mut out = RelayedEntry::new(e.seq, e.kind.clone(), text);
             out.cause = e.cause;
+            out.version = spec.version;
             entries.push(out);
         }
         let mut out = Resumed::new(
@@ -390,17 +482,31 @@ impl Relay for Memory {
         out
     }
 
-    fn ingest(&self, source: &str, relayed: RelayedEntry) -> Result<u64, IngestError> {
+    fn ingest(&self, origin: &Origin, relayed: RelayedEntry) -> Result<u64, IngestError> {
+        let crossing = Crossing::new(origin, &relayed.kind, relayed.version, false);
+        if let Err(reason) = self.inner.authorize(&crossing) {
+            return Err(IngestError::Refused {
+                kind: relayed.kind,
+                reason,
+            });
+        }
         let mut entry = JournalEntry::new(0, relayed.kind.clone());
         entry.cause = relayed.cause;
-        entry.source = Some(source.to_owned());
+        entry.origin = Some(origin.clone());
         let Some((key, spec)) = self.inner.spec(&relayed.kind) else {
             entry.text = Some(relayed.text);
             return Ok(self.inner.record(entry, None));
         };
-        let Some(codec) = spec.relay else {
+        let Some(codec) = spec.relay.filter(|_| key.kind == PointKind::Event) else {
             return Err(IngestError::NotRelayable { kind: relayed.kind });
         };
+        if spec.version != relayed.version {
+            return Err(IngestError::Version {
+                kind: relayed.kind,
+                sent: relayed.version,
+                here: spec.version,
+            });
+        }
         let input = (codec.decode)(&relayed.text).map_err(|reason| IngestError::Decode {
             kind: relayed.kind.clone(),
             reason,
@@ -408,6 +514,85 @@ impl Relay for Memory {
         entry.input = Some(input.clone());
         entry.text = Some(relayed.text);
         Ok(self.inner.record(entry, Some((key, input, codec.fresh))))
+    }
+
+    fn answer(&self, origin: &Origin, ask: RelayedAsk) -> RelayedAnswer {
+        let got = Instant::now();
+        let key = (origin.process.clone(), ask.run, ask.id);
+        if let Some(first) = self.inner.answered.lock().unwrap().get(&key) {
+            return first.clone();
+        }
+        let answer = RelayedAnswer::to(&ask, self.answer_once(origin, &ask, got));
+        self.inner
+            .answered
+            .lock()
+            .unwrap()
+            .insert(key, answer.clone());
+        answer
+    }
+
+    fn add_authority(&self, authority: Authority) {
+        self.inner.authorities.lock().unwrap().push(authority);
+    }
+}
+
+impl Memory {
+    fn answer_once(&self, origin: &Origin, ask: &RelayedAsk, got: Instant) -> Answer {
+        let crossing = Crossing::new(origin, &ask.kind, ask.version, true);
+        if let Err(reason) = self.inner.authorize(&crossing) {
+            return Answer::refused(reason);
+        }
+        let Some((key, spec)) = self.inner.spec(&ask.kind) else {
+            return Answer::refused(format!("`{}` is not declared here", ask.kind));
+        };
+        let Some(codec) = spec
+            .relay
+            .filter(|c| key.kind == PointKind::Request && c.answers())
+        else {
+            return Answer::refused(format!("`{}` is not a relayable request here", ask.kind));
+        };
+        if spec.version != ask.version {
+            return Answer::refused(format!(
+                "`{}`: asked at version {}, declared here at version {}",
+                ask.kind, ask.version, spec.version
+            ));
+        }
+        let input = match (codec.decode)(&ask.input) {
+            Ok(input) => input,
+            Err(reason) => return Answer::refused(format!("cannot read the input: {reason}")),
+        };
+        let mut value = (codec.fresh)();
+        if let Err(reason) = (codec.decode_value.unwrap())(&ask.value, &mut *value) {
+            return Answer::refused(format!("cannot read the value: {reason}"));
+        }
+        if got.elapsed() > ask.deadline {
+            return Answer::refused("the deadline passed before the listeners ran");
+        }
+        let out = self
+            .inner
+            .alter(key, input, value, codec.clone_value.unwrap());
+        if got.elapsed() > ask.deadline {
+            return Answer::Refused {
+                listener: None,
+                owner: None,
+                reason: format!(
+                    "the listeners ended past the deadline of {:?}",
+                    ask.deadline
+                ),
+                failed: true,
+            };
+        }
+        if let Some(r) = out.refused {
+            return Answer::Refused {
+                listener: Some(r.listener),
+                owner: r.owner,
+                reason: r.reason,
+                failed: r.failed,
+            };
+        }
+        Answer::Done {
+            value: (codec.encode_value.unwrap())(&*out.value).expect("the point's value"),
+        }
     }
 }
 
@@ -669,7 +854,7 @@ fn since_reads_from_a_number_and_reports_a_gap() {
     assert_eq!(read.entries[1].cause, Some(1));
     assert_eq!(read.entries[1].read::<StepComputed>(), Some(&11));
     assert_eq!(read.entries[1].read::<VolumeMounted>(), None);
-    assert!(read.entries[1].source.is_none());
+    assert!(read.entries[1].origin.is_none());
 
     for n in 12..16 {
         journal.publish::<StepComputed>(n).unwrap();
@@ -733,6 +918,10 @@ fn patterns_match_an_id_a_prefix_or_everything() {
 
 // --- Relay ---
 
+fn node_origin() -> Origin {
+    Origin::process("node")
+}
+
 /// A node and a desktop, each with its bus, and a listener on the
 /// desktop that records what it hears.
 /// What a listener heard.
@@ -781,7 +970,7 @@ fn relayable_events_cross_and_are_delivered_as_local_ones() {
     assert_eq!(read.next, node.relay().unwrap().cursor());
 
     for e in read.entries {
-        desktop.relay().unwrap().ingest("node", e).unwrap();
+        desktop.relay().unwrap().ingest(&node_origin(), e).unwrap();
     }
     let dj = desktop.journal().unwrap();
     assert!(dj.flush(WAIT));
@@ -790,7 +979,7 @@ fn relayable_events_cross_and_are_delivered_as_local_ones() {
         [imported("/a", 1), imported("/b", 2)]
     );
     let kept = dj.since(0, 10);
-    assert_eq!(kept.entries[1].source.as_deref(), Some("node"));
+    assert_eq!(kept.entries[1].origin, Some(node_origin()));
     assert_eq!(kept.entries[1].cause, Some(1), "the sender's number");
     assert_eq!(kept.entries[1].text.as_deref(), Some("/b|2"));
     assert_eq!(
@@ -866,12 +1055,15 @@ fn ingest_refuses_what_it_cannot_read_and_keeps_unknown_kinds_as_text() {
     // A newer sender's extra field is read; a broken payload is not.
     relay
         .ingest(
-            "node",
+            &node_origin(),
             RelayedEntry::new(1, "library.imported", "/a|4|new-field"),
         )
         .unwrap();
     let err = relay
-        .ingest("node", RelayedEntry::new(2, "library.imported", "/a"))
+        .ingest(
+            &node_origin(),
+            RelayedEntry::new(2, "library.imported", "/a"),
+        )
         .unwrap_err();
     assert_eq!(
         err,
@@ -882,7 +1074,7 @@ fn ingest_refuses_what_it_cannot_read_and_keeps_unknown_kinds_as_text() {
     );
     // Declared here but not relayable: refused.
     let err = relay
-        .ingest("node", RelayedEntry::new(3, "engine.step", "7"))
+        .ingest(&node_origin(), RelayedEntry::new(3, "engine.step", "7"))
         .unwrap_err();
     assert_eq!(
         err,
@@ -893,7 +1085,10 @@ fn ingest_refuses_what_it_cannot_read_and_keeps_unknown_kinds_as_text() {
     assert!(err.to_string().contains("not relayable"), "{err}");
     // Unknown here: kept as text, heard by no one.
     let seq = relay
-        .ingest("node", RelayedEntry::new(4, "extract.item", "{\"n\":1}"))
+        .ingest(
+            &node_origin(),
+            RelayedEntry::new(4, "extract.item", "{\"n\":1}"),
+        )
         .unwrap();
     assert_eq!(seq, 2);
 
@@ -904,4 +1099,451 @@ fn ingest_refuses_what_it_cannot_read_and_keeps_unknown_kinds_as_text() {
     assert_eq!(kept[0].kind, "extract.item");
     assert!(kept[0].input.is_none());
     assert_eq!(kept[0].text.as_deref(), Some("{\"n\":1}"));
+}
+
+// --- Crossing: requests answered on the other side ---
+
+/// A request the node answers for the desktop: delete files. The value
+/// is what each side did.
+struct FileDelete;
+impl Point for FileDelete {
+    const ID: &'static str = "files.delete";
+    const KIND: PointKind = PointKind::Request;
+    type Input = String;
+    type Value = Vec<String>;
+}
+
+impl Relayed for FileDelete {
+    fn encode(input: &String) -> String {
+        input.clone()
+    }
+    fn decode(text: &str) -> Result<String, String> {
+        Ok(text.to_owned())
+    }
+}
+
+/// `a,b,c`; empty for no step.
+impl RelayedRequest for FileDelete {
+    fn encode_value(value: &Vec<String>) -> String {
+        value.join(",")
+    }
+    fn decode_value(text: &str) -> Result<Vec<String>, String> {
+        if text.contains('|') {
+            return Err("a `|` in the value".into());
+        }
+        Ok(text
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect())
+    }
+}
+
+/// A plain alter point: it never crosses.
+struct Title;
+impl Point for Title {
+    const ID: &'static str = "doc.title";
+    type Input = ();
+    type Value = String;
+}
+
+impl Relayed for Title {
+    fn encode(_: &()) -> String {
+        String::new()
+    }
+    fn decode(_: &str) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+const ASK_DEADLINE: Duration = Duration::from_millis(300);
+
+fn crossing_table(version: u32) -> [PointDecl; 2] {
+    [
+        PointDecl::of::<LibraryImported>("Photos were imported.")
+            .relayable(Codec::of::<LibraryImported>())
+            .version(version),
+        PointDecl::of::<FileDelete>("Files are deleted.")
+            .relayable(Codec::request::<FileDelete>())
+            .version(version),
+    ]
+}
+
+fn desktop_origin() -> Origin {
+    Origin::process("desktop")
+}
+
+/// A desktop asking `files.delete` of a node through a direct call: the
+/// transport is a function, the meaning is the contract's. The desktop
+/// has a listener of its own before the far side's turn.
+fn asker_and_node(node_version: u32) -> (Arc<dyn Bus>, Arc<dyn Bus>) {
+    let node = Memory::full();
+    let desktop = Memory::full();
+    assert!(declare_all(&*node, &crossing_table(node_version)).is_empty());
+    assert!(declare_all(&*desktop, &crossing_table(1)).is_empty());
+    desktop
+        .listen::<FileDelete>("desktop.confirm", ListenOpts::new(), |_, did| {
+            did.push("desktop.confirm".into());
+            Ok(())
+        })
+        .unwrap();
+    let far = node.clone();
+    desktop
+        .listen_any(
+            bus_contract::PointKey::of::<FileDelete>(),
+            "desktop.node".into(),
+            ListenOpts::new().deadline(ASK_DEADLINE).owner("bridge"),
+            far_listener(
+                Codec::request::<FileDelete>(),
+                ASK_DEADLINE,
+                1,
+                move |ask| Some(far.relay().unwrap().answer(&desktop_origin(), ask)),
+            ),
+        )
+        .unwrap();
+    (desktop, node)
+}
+
+fn node_deletes(node: &Arc<dyn Bus>) -> Arc<Mutex<Vec<String>>> {
+    let ran: Arc<Mutex<Vec<String>>> = Arc::default();
+    let r = ran.clone();
+    node.listen::<FileDelete>("node.vault", ListenOpts::new(), move |path, did| {
+        r.lock().unwrap().push(path.clone());
+        did.push("node.vault".into());
+        Ok(())
+    })
+    .unwrap();
+    ran
+}
+
+#[test]
+fn a_relayable_request_is_fail_closed_and_only_events_and_requests_cross() {
+    let [_, delete] = crossing_table(3);
+    assert_eq!(delete.kind, PointKind::Request);
+    assert!(delete.fail_closed && !delete.journaled);
+    assert_eq!(delete.version, 3);
+    assert_eq!(delete.required(), [Capability::Relay]);
+    assert!(Codec::request::<FileDelete>().answers());
+    assert!(!Codec::of::<LibraryImported>().answers());
+
+    let bus = Memory::full();
+    assert!(declare_all(&*bus, &crossing_table(3)).is_empty());
+    let info = bus
+        .points()
+        .into_iter()
+        .find(|p| p.id == "files.delete")
+        .unwrap();
+    assert!(info.relayable && info.fail_closed && !info.journaled);
+    assert_eq!(info.version, 3);
+
+    let bus = Memory::full();
+    let table = [
+        PointDecl::of::<Title>("A title.").relayable(Codec::of::<Title>()),
+        PointDecl::of::<FileDelete>("No value codec.").relayable(Codec::of::<FileDelete>()),
+    ];
+    assert_eq!(
+        declare_all(&*bus, &table),
+        [
+            Refused::NotCrossable { point: "doc.title" },
+            Refused::NotCrossable {
+                point: "files.delete"
+            },
+        ]
+    );
+    let err = Refused::NotCrossable { point: "doc.title" }.to_string();
+    assert!(err.contains("cannot cross"), "{err}");
+}
+
+#[test]
+fn a_request_answered_on_the_other_side_means_what_it_means_here() {
+    let (desktop, node) = asker_and_node(1);
+    let ran = node_deletes(&node);
+    let out = desktop.alter::<FileDelete>("/a.jpg".into(), Vec::new());
+    assert!(out.refused.is_none(), "{:?}", out.refused);
+    assert_eq!(out.value, ["desktop.confirm", "node.vault"]);
+    assert_eq!(*ran.lock().unwrap(), ["/a.jpg"]);
+
+    // The same request emitted on the node itself: the same listeners,
+    // the same value.
+    let here = node.alter::<FileDelete>("/a.jpg".into(), vec!["desktop.confirm".into()]);
+    assert_eq!(here.value, out.value);
+}
+
+#[test]
+fn a_veto_on_the_other_side_refuses_with_its_reason() {
+    let (desktop, node) = asker_and_node(1);
+    node.listen::<FileDelete>("node.guard", ListenOpts::new(), |_, _| {
+        Err(HookError::refuse("the volume is read-only"))
+    })
+    .unwrap();
+    let ran = node_deletes(&node);
+    let out = desktop.alter::<FileDelete>("/a.jpg".into(), Vec::new());
+    let refusal = out.refused.expect("refused");
+    assert_eq!(refusal.listener, "desktop.node");
+    assert!(!refusal.failed);
+    assert!(
+        refusal.reason.contains("node.guard") && refusal.reason.contains("read-only"),
+        "{}",
+        refusal.reason
+    );
+    assert!(ran.lock().unwrap().is_empty(), "the veto stopped the node");
+    assert_eq!(out.value, ["desktop.confirm"], "the far edit is dropped");
+}
+
+#[test]
+fn no_answer_in_time_is_a_refusal() {
+    let desktop = Memory::full();
+    assert!(declare_all(&*desktop, &crossing_table(1)).is_empty());
+    let key = bus_contract::PointKey::of::<FileDelete>();
+    desktop
+        .listen_any(
+            key,
+            "desktop.gone".into(),
+            ListenOpts::new(),
+            far_listener(Codec::request::<FileDelete>(), ASK_DEADLINE, 1, |_| None),
+        )
+        .unwrap();
+    let out = desktop.alter::<FileDelete>("/a.jpg".into(), Vec::new());
+    let refusal = out.refused.expect("no answer refuses");
+    assert!(refusal.reason.contains("no answer"), "{}", refusal.reason);
+
+    // An answer that comes after the deadline is dropped: still refused.
+    let desktop = Memory::full();
+    assert!(declare_all(&*desktop, &crossing_table(1)).is_empty());
+    desktop
+        .listen_any(
+            key,
+            "desktop.slow".into(),
+            ListenOpts::new(),
+            far_listener(
+                Codec::request::<FileDelete>(),
+                Duration::from_millis(20),
+                1,
+                |ask| {
+                    thread::sleep(Duration::from_millis(60));
+                    Some(RelayedAnswer::to(&ask, Answer::Done { value: "x".into() }))
+                },
+            ),
+        )
+        .unwrap();
+    let out = desktop.alter::<FileDelete>("/a.jpg".into(), Vec::new());
+    let refusal = out.refused.expect("a late answer refuses");
+    assert!(refusal.reason.contains("after"), "{}", refusal.reason);
+    assert!(out.value.is_empty());
+
+    // An answer to another ask, or one that cannot be read: refused.
+    for answer in [
+        |ask: &RelayedAsk| {
+            let mut other = ask.clone();
+            other.id += 1;
+            RelayedAnswer::to(&other, Answer::Done { value: "x".into() })
+        },
+        |ask: &RelayedAsk| {
+            RelayedAnswer::to(
+                ask,
+                Answer::Done {
+                    value: "a|b".into(),
+                },
+            )
+        },
+    ] {
+        let desktop = Memory::full();
+        assert!(declare_all(&*desktop, &crossing_table(1)).is_empty());
+        desktop
+            .listen_any(
+                key,
+                "desktop.odd".into(),
+                ListenOpts::new(),
+                far_listener(
+                    Codec::request::<FileDelete>(),
+                    ASK_DEADLINE,
+                    1,
+                    move |ask| Some(answer(&ask)),
+                ),
+            )
+            .unwrap();
+        let out = desktop.alter::<FileDelete>("/a.jpg".into(), Vec::new());
+        assert!(out.refused.is_some());
+        assert!(out.value.is_empty());
+    }
+}
+
+#[test]
+fn the_far_side_refuses_an_ask_past_its_deadline() {
+    let node = Memory::full();
+    assert!(declare_all(&*node, &crossing_table(1)).is_empty());
+    let ran = node_deletes(&node);
+    let relay = node.relay().unwrap();
+    let ask = RelayedAsk::new(1, 1, "files.delete", Duration::ZERO, "/a", "");
+    thread::sleep(Duration::from_millis(1));
+    match relay.answer(&desktop_origin(), ask).answer {
+        Answer::Refused { listener: None, .. } => {}
+        other => panic!("{other:?}"),
+    }
+    assert!(ran.lock().unwrap().is_empty(), "no listener ran");
+
+    // Listeners that end past the deadline: refused (failed), whatever
+    // they did, as the asker holds it.
+    node.listen::<FileDelete>("node.slow", ListenOpts::new(), |_, _| {
+        thread::sleep(Duration::from_millis(40));
+        Ok(())
+    })
+    .unwrap();
+    let ask = RelayedAsk::new(1, 2, "files.delete", Duration::from_millis(10), "/b", "");
+    match relay.answer(&desktop_origin(), ask).answer {
+        Answer::Refused { failed: true, .. } => {}
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn each_ask_is_answered_once() {
+    let node = Memory::full();
+    assert!(declare_all(&*node, &crossing_table(1)).is_empty());
+    let ran = node_deletes(&node);
+    let relay = node.relay().unwrap();
+    let ask = RelayedAsk::new(7, 1, "files.delete", ASK_DEADLINE, "/a", "");
+    let first = relay.answer(&desktop_origin(), ask.clone());
+    let again = relay.answer(&desktop_origin(), ask.clone());
+    assert_eq!(first, again);
+    assert_eq!(
+        first.answer,
+        Answer::Done {
+            value: "node.vault".into()
+        }
+    );
+    assert_eq!(ran.lock().unwrap().len(), 1, "run once");
+    // Another run (the asker restarted) is another ask.
+    let mut restarted = ask;
+    restarted.run = 8;
+    relay.answer(&desktop_origin(), restarted);
+    assert_eq!(ran.lock().unwrap().len(), 2);
+}
+
+#[test]
+fn what_is_not_a_relayable_request_here_is_refused() {
+    let node = Memory::full();
+    assert!(declare_all(&*node, &crossing_table(1)).is_empty());
+    assert!(declare_all(&*node, &[PointDecl::of::<DocClose>("Local only.")]).is_empty());
+    let relay = node.relay().unwrap();
+    for (n, kind) in ["unknown.point", "doc.close", "library.imported"]
+        .into_iter()
+        .enumerate()
+    {
+        let ask = RelayedAsk::new(1, n as u64, kind, ASK_DEADLINE, "/a|1", "");
+        match relay.answer(&desktop_origin(), ask).answer {
+            Answer::Refused { listener: None, .. } => {}
+            other => panic!("{kind}: {other:?}"),
+        }
+    }
+    // A request is asked, not ingested.
+    assert_eq!(
+        relay.ingest(&node_origin(), RelayedEntry::new(1, "files.delete", "/a")),
+        Err(IngestError::NotRelayable {
+            kind: "files.delete".into()
+        })
+    );
+}
+
+#[test]
+fn every_entry_taken_in_carries_its_origin() {
+    let desktop = Memory::full();
+    assert!(declare_all(&*desktop, &crossing_table(1)).is_empty());
+    let from = Origin::process("agent-socket").agent("claude");
+    desktop
+        .relay()
+        .unwrap()
+        .ingest(&from, RelayedEntry::new(1, "library.imported", "/a|1"))
+        .unwrap();
+    let kept = desktop.journal().unwrap().since(0, 10);
+    assert_eq!(kept.entries[0].origin, Some(from.clone()));
+    assert_eq!(from.to_string(), "agent-socket (agent claude)");
+    assert_eq!(node_origin().to_string(), "node");
+}
+
+#[test]
+fn an_authority_refuses_what_comes_in_before_anything_is_recorded_or_run() {
+    let node = Memory::full();
+    assert!(declare_all(&*node, &crossing_table(1)).is_empty());
+    let ran = node_deletes(&node);
+    let relay = node.relay().unwrap();
+    let seen: Arc<Mutex<Vec<(String, String, bool)>>> = Arc::default();
+    let s = seen.clone();
+    relay.authorize(move |c| {
+        s.lock()
+            .unwrap()
+            .push((c.origin.to_string(), c.kind.to_owned(), c.ask));
+        Ok(())
+    });
+    relay.authorize(|c| match &c.origin.agent {
+        Some(agent) if c.kind == "files.delete" => Err(format!("{agent} may not delete")),
+        _ => Ok(()),
+    });
+
+    let agent = Origin::process("desktop").agent("claude");
+    let ask = RelayedAsk::new(1, 1, "files.delete", ASK_DEADLINE, "/a", "");
+    assert_eq!(
+        relay.answer(&agent, ask).answer,
+        Answer::refused("claude may not delete")
+    );
+    assert!(ran.lock().unwrap().is_empty());
+    // The same ask from the process itself is let through.
+    let ask = RelayedAsk::new(1, 2, "files.delete", ASK_DEADLINE, "/a", "");
+    assert!(matches!(
+        relay.answer(&desktop_origin(), ask).answer,
+        Answer::Done { .. }
+    ));
+    assert_eq!(seen.lock().unwrap().len(), 2, "each authority, in order");
+
+    // Events too; a panicking authority refuses.
+    relay.authorize(|c| {
+        if c.origin.process == "rogue" {
+            panic!("boom");
+        }
+        Ok(())
+    });
+    let err = relay
+        .ingest(
+            &Origin::process("rogue"),
+            RelayedEntry::new(1, "library.imported", "/a|1"),
+        )
+        .unwrap_err();
+    assert!(matches!(err, IngestError::Refused { .. }), "{err}");
+    assert!(err.to_string().contains("refused"), "{err}");
+    assert_eq!(node.journal().unwrap().last_seq(), 0, "nothing recorded");
+}
+
+#[test]
+fn a_point_crosses_only_at_the_same_version() {
+    let (desktop, node) = asker_and_node(2);
+    let ran = node_deletes(&node);
+    let out = desktop.alter::<FileDelete>("/a.jpg".into(), Vec::new());
+    let refusal = out.refused.expect("another version refuses");
+    assert!(refusal.reason.contains("version"), "{}", refusal.reason);
+    assert!(ran.lock().unwrap().is_empty());
+
+    let err = node
+        .relay()
+        .unwrap()
+        .ingest(
+            &desktop_origin(),
+            RelayedEntry::new(1, "library.imported", "/a|1"),
+        )
+        .unwrap_err();
+    assert_eq!(
+        err,
+        IngestError::Version {
+            kind: "library.imported".into(),
+            sent: 1,
+            here: 2
+        }
+    );
+
+    // Served with its version.
+    node.journal()
+        .unwrap()
+        .publish::<LibraryImported>(imported("/b", 1))
+        .unwrap();
+    let read = node.relay().unwrap().resume(Cursor::START, 10);
+    assert_eq!(read.entries[0].version, 2);
 }
