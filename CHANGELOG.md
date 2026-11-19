@@ -1,10 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.3.3
 
-- README: "Naming points". A point id starts with the declaring crate's
-  prefix (`<crate>.<subject>.<moment>`), so libraries sharing one bus
-  cannot collide.
+- Docs: point ids start with the declaring crate's prefix,
+  `<crate>.<subject>.<moment>`. README: "Naming points", so libraries
+  sharing one bus cannot collide.
 
 ## 0.3.2
 
