@@ -56,9 +56,10 @@ construction. There is no global.
   naming a listener that is not there).
 - No dependencies, no `unsafe`, no async runtime.
 
-This crate has no implementation. One is `Kernel` in
-[`egui-pop-hooks`](https://github.com/quazardous/egui-pop). The
-guarantees an implementation must keep are documented on `Bus`.
+This crate has no implementation. The reference one is `Kernel` in
+[`bus-kernel`](https://github.com/quazardous/bus-kernel), whose
+`conformance` feature checks any implementation against the guarantees
+documented on `Bus`.
 
 ## Example
 
@@ -101,7 +102,7 @@ impl Documents {
 The application creates the bus and passes it to each library:
 
 ```rust,ignore
-let bus: Arc<dyn Bus> = Arc::new(egui_pop_hooks::Kernel::new()); // or its own
+let bus: Arc<dyn Bus> = Arc::new(bus_kernel::Kernel::new()); // or its own
 let docs = Documents::new(bus.clone());
 let search = Search::new(bus.clone());
 print!("{}", bus_contract::order_dump(&*bus, &["doc.close"]));

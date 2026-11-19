@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Docs: the reference implementation is `bus-kernel`'s `Kernel` (it
+  moved out of `egui-pop-hooks`), with a `conformance` feature that
+  checks any implementation.
+
 ## 0.4.0
 
 Crossing: what may cross a process boundary and what it means. The
