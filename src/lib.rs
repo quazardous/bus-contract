@@ -239,35 +239,136 @@ pub trait Bus: Send + Sync {
     /// for a point nobody declared or listened to.
     fn listeners(&self, point: &str) -> Option<Vec<ListenerInfo>>;
 
-    /// The [`Defer`] capability: requests asked now, heard at the next
-    /// drain on the same thread. `None` (the default) when the
-    /// implementation does not offer it.
-    fn defer(&self) -> Option<&dyn Defer> {
+    /// Looks a capability up by the `TypeId` of its trait object type
+    /// (`TypeId::of::<dyn Journal>()`): the bus as [`Any`] and the cast
+    /// to that trait ([`Provided`]), or `None` (the default) when the
+    /// implementation does not offer it. The typed call is
+    /// [`capability`] (`capability::<dyn Journal, _>(bus)`, or
+    /// `bus.get::<dyn Journal>()` on a `dyn Bus`).
+    ///
+    /// This is how a bus offers a capability whose trait the core does
+    /// not name: an extension contract defines its trait, a bus answers
+    /// for its `TypeId`, and a library reaches it through [`capability`].
+    /// The four getters below ([`Bus::defer`], [`Bus::timings`],
+    /// [`Bus::journal`], [`Bus::relay`]) default to this lookup, so a
+    /// new implementation writes `capability` only.
+    ///
+    /// An implementation that overrides the getters and not this method
+    /// keeps working through the getters, [`offers`] and [`declare_all`],
+    /// but the lookup does not see those capabilities. One that writes
+    /// both answers the same through each: a getter and the lookup give
+    /// `Some` together, and the same object.
+    ///
+    /// ```
+    /// use std::any::{Any, TypeId};
+    /// use bus_contract::{Cast, Provided};
+    /// # trait Journal {}
+    /// # struct MyBus;
+    /// # impl Journal for MyBus {}
+    /// fn as_journal(bus: &dyn Any) -> Option<&(dyn Journal + 'static)> {
+    ///     bus.downcast_ref::<MyBus>().map(|b| b as _)
+    /// }
+    /// static AS_JOURNAL: Cast<dyn Journal> = as_journal;
+    ///
+    /// // in `impl Bus for MyBus`:
+    /// fn capability(bus: &MyBus, contract: TypeId) -> Option<Provided<'_>> {
+    ///     (contract == TypeId::of::<dyn Journal>())
+    ///         .then(|| Provided::new::<dyn Journal>(bus, &AS_JOURNAL))
+    /// }
+    /// # assert!(capability(&MyBus, TypeId::of::<dyn Journal>()).is_some());
+    /// ```
+    fn capability(&self, contract: TypeId) -> Option<Provided<'_>> {
+        let _ = contract;
         None
     }
 
+    /// The [`Defer`] capability: requests asked now, heard at the next
+    /// drain on the same thread. `None` when the implementation does not
+    /// offer it. By default, what [`Bus::capability`] answers for
+    /// `dyn Defer`.
+    fn defer(&self) -> Option<&dyn Defer> {
+        capability::<dyn Defer, Self>(self)
+    }
+
     /// The [`Timings`] capability: how long listeners take, per point and
-    /// listener, and passes over a point's budget reported. `None` (the
-    /// default) when the implementation does not offer it.
+    /// listener, and passes over a point's budget reported. `None` when
+    /// the implementation does not offer it. By default, what
+    /// [`Bus::capability`] answers for `dyn Timings`.
     fn timings(&self) -> Option<&dyn Timings> {
-        None
+        capability::<dyn Timings, Self>(self)
     }
 
     /// The [`Journal`] capability: events of journaled points kept with a
     /// number, read again from one, delivered after the publisher has
-    /// moved on. `None` (the default) when the implementation does not
-    /// offer it.
+    /// moved on. `None` when the implementation does not offer it. By
+    /// default, what [`Bus::capability`] answers for `dyn Journal`.
     fn journal(&self) -> Option<&dyn Journal> {
-        None
+        capability::<dyn Journal, Self>(self)
     }
 
     /// The [`Relay`] capability: events of relayable points served to
     /// another process from a cursor and taken in from one, asks of
-    /// relayable requests answered for one. `None` (the default) when
-    /// the implementation does not offer it; a bus that offers it offers
-    /// [`Bus::journal`].
+    /// relayable requests answered for one. `None` when the
+    /// implementation does not offer it; a bus that offers it offers
+    /// [`Bus::journal`]. By default, what [`Bus::capability`] answers for
+    /// `dyn Relay`.
     fn relay(&self) -> Option<&dyn Relay> {
-        None
+        capability::<dyn Relay, Self>(self)
+    }
+}
+
+/// The cast a bus gives for the capability `C` ([`Provided::new`]): from
+/// the bus as [`Any`] to `C`. A plain function, usually a `static`, that
+/// downcasts to the implementation's type and coerces.
+pub type Cast<C> = for<'x> fn(&'x dyn Any) -> Option<&'x C>;
+
+/// A capability found on a bus ([`Bus::capability`]): the bus as [`Any`]
+/// and the cast from it to the capability's trait. [`capability`] turns
+/// it into `&C`.
+///
+/// The cast travels as `Any` because `C` is unsized (`dyn Journal`),
+/// which `downcast_ref` cannot target, while a function pointer is
+/// sized: the lookup checks the cast is a [`Cast<C>`] for the `C` asked,
+/// so a bus that answers one `TypeId` with another capability's cast
+/// gives `None`, never a wrong type.
+#[derive(Clone, Copy)]
+pub struct Provided<'a> {
+    this: &'a dyn Any,
+    cast: &'static (dyn Any + Send + Sync),
+}
+
+impl<'a> Provided<'a> {
+    /// The capability `C` of the bus `this`, reached through `cast`.
+    pub fn new<C: ?Sized + 'static>(this: &'a dyn Any, cast: &'static Cast<C>) -> Provided<'a> {
+        Provided { this, cast }
+    }
+}
+
+impl std::fmt::Debug for Provided<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Provided").finish_non_exhaustive()
+    }
+}
+
+/// The capability `C` of `bus`, a trait object type such as
+/// `dyn Journal`: what [`Bus::capability`] answers for
+/// `TypeId::of::<C>()`, cast to `C`. `None` when the bus does not offer
+/// it through the lookup.
+///
+/// ```ignore
+/// let journal = bus_contract::capability::<dyn Journal, _>(&bus);
+/// ```
+pub fn capability<C: ?Sized + 'static, B: Bus + ?Sized>(bus: &B) -> Option<&C> {
+    let provided = bus.capability(TypeId::of::<C>())?;
+    let cast = provided.cast.downcast_ref::<Cast<C>>()?;
+    cast(provided.this)
+}
+
+impl<'a> dyn Bus + 'a {
+    /// The capability `C` of this bus, a trait object type such as
+    /// `dyn Journal` ([`capability`]).
+    pub fn get<C: ?Sized + 'static>(&self) -> Option<&C> {
+        capability::<C, Self>(self)
     }
 }
 
@@ -452,6 +553,10 @@ impl<B: Bus + ?Sized> Bus for Arc<B> {
 
     fn listeners(&self, point: &str) -> Option<Vec<ListenerInfo>> {
         (**self).listeners(point)
+    }
+
+    fn capability(&self, contract: TypeId) -> Option<Provided<'_>> {
+        (**self).capability(contract)
     }
 
     fn defer(&self) -> Option<&dyn Defer> {

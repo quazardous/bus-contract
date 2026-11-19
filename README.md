@@ -228,6 +228,34 @@ implementation offers.
   when it gets `None`.
 - `offers(bus, Capability::Defer)` tells whether a bus has one.
 
+Each capability is also found by a typed lookup:
+`Bus::capability(TypeId)` returns the bus as `Any` with a cast to the
+capability's trait (`Provided`), and `capability::<dyn Journal, _>(&bus)`
+or `bus.get::<dyn Journal>()` on a `dyn Bus` gives `Option<&dyn
+Journal>`. The four getters default to this lookup, so an implementation
+writes one method, `capability`, with one small cast per capability:
+
+```rust,ignore
+fn as_journal(bus: &dyn Any) -> Option<&(dyn Journal + 'static)> {
+    bus.downcast_ref::<MyBus>().map(|b| b as _)
+}
+static AS_JOURNAL: Cast<dyn Journal> = as_journal;
+
+impl Bus for MyBus {
+    // …the core methods…
+    fn capability(&self, contract: TypeId) -> Option<Provided<'_>> {
+        (contract == TypeId::of::<dyn Journal>())
+            .then(|| Provided::new::<dyn Journal>(self, &AS_JOURNAL))
+    }
+}
+```
+
+The lookup is keyed by the trait's `TypeId`, so the core can reach a
+capability whose trait it does not name: it is how capability contracts
+will move to crates of their own. An implementation that overrides the
+getters (written before 0.4.4) keeps working; its lookup answers `None`
+until it implements `capability`.
+
 ### Defer
 
 `Bus::defer()` returns `Option<&dyn Defer>`. A request asked through it
