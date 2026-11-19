@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.4.0 (unreleased)
+## 0.4.0
 
 Crossing: what may cross a process boundary and what it means. The
 transport stays out of the contract.
