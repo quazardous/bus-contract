@@ -1,0 +1,11 @@
+[package]
+name = "bus-contract-testkit"
+version = "0.0.0"
+description = "Test buses shared by the tests of the bus-contract workspace. Not published."
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+bus-contract = { path = "../.." }

@@ -17,6 +17,27 @@ A library declares its points and listeners against the `Bus` trait.
 The application creates the bus and passes it to each library at
 construction. There is no global.
 
+## Crates
+
+This repository is a Cargo workspace. Each crate is released and
+versioned on its own ([RELEASING.md](https://github.com/quazardous/bus-contract/blob/main/RELEASING.md)):
+
+| Crate | Contract |
+|---|---|
+| [`bus-contract`](https://crates.io/crates/bus-contract) | the core: points, order, alter and collect, requests, local listeners, introspection, and the capability lookup |
+| [`bus-contract-defer`](https://crates.io/crates/bus-contract-defer) | `Defer`: requests asked now, run at the next drain |
+| [`bus-contract-timings`](https://crates.io/crates/bus-contract-timings) | `Timings`: listener times and budgets |
+| [`bus-contract-journal`](https://crates.io/crates/bus-contract-journal) | `Journal`: numbered events, read again, delivered off the publisher |
+| [`bus-contract-crossing`](https://crates.io/crates/bus-contract-crossing) | `Relay`: what crosses a process boundary, on top of the journal |
+
+Today the four capability crates re-export the core's own items and add
+an extension trait each (`BusDefer`, `BusTimings`, `BusJournal`,
+`BusCrossing`) that gives `bus.defer()`, `bus.timings()`,
+`bus.journal()` and `bus.relay()` on any bus. In `bus-contract` 0.5 the
+capability traits move into these crates and the core keeps only the
+lookup: code that imports the capability items from the crates now has
+only a `use` line to add then.
+
 ## Contents
 
 - **Points are types** (`Point`): an id (`doc.close`), the input every
@@ -255,6 +276,11 @@ capability whose trait it does not name: it is how capability contracts
 will move to crates of their own. An implementation that overrides the
 getters (written before 0.4.4) keeps working; its lookup answers `None`
 until it implements `capability`.
+
+Each capability is also published as a crate of its own
+(`bus-contract-defer`, `-timings`, `-journal`, `-crossing`; see
+[Crates](#crates)). Import the capability's items from there to be
+ready for 0.5, which moves them out of the core.
 
 ### Defer
 

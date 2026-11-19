@@ -1,0 +1,21 @@
+[package]
+name = "bus-contract-timings"
+version = "0.1.0"
+description = "The timings contract of bus-contract: how long listeners take, per point and per listener, and the passes over a point's budget. Today a facade over the bus-contract core, so code can switch its imports before the core 0.5 moves the capability here."
+readme = "README.md"
+include = ["src/", "README.md", "CHANGELOG.md", "LICENSE-*"]
+keywords = ["event-bus", "contract", "hooks", "timings"]
+categories = ["rust-patterns", "development-tools"]
+documentation = "https://docs.rs/bus-contract-timings"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[dependencies]
+bus-contract = { version = "0.4.4", path = "../.." }
+
+[dev-dependencies]
+bus-contract-testkit = { path = "../testkit" }

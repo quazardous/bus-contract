@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.5
+
+Docs and packaging only: no change to the traits or their behaviour.
+
+- The repository is now a Cargo workspace. Next to this crate, the four
+  capability contracts are published as crates of their own, each
+  versioned on its own: `bus-contract-defer`, `bus-contract-timings`,
+  `bus-contract-journal` and `bus-contract-crossing` (0.1.0). They
+  re-export this crate's items for their capability and add an
+  extension trait (`BusDefer`, `BusTimings`, `BusJournal`,
+  `BusCrossing`). The README lists them; importing the capability items
+  from them now prepares for 0.5, which moves the traits there.
+- The package leaves out the other crates and the CI files.
+
 ## 0.4.4
 
 Additive: nothing changes for existing implementations or callers.
