@@ -87,7 +87,7 @@ pub type BudgetSink = Arc<dyn Fn(&OverBudget) + Send + Sync>;
 
 /// The bus contract: hook points, their listeners in a declared order,
 /// emits and introspection. An application supplies one implementation
-/// (its own, or one written for it, such as `egui-pop-hooks`'s `Kernel`)
+/// (its own, or one written for it, such as `bus-kernel`'s `Kernel`)
 /// and hands it to each
 /// library at construction; a library never constructs the bus it
 /// publishes on.
