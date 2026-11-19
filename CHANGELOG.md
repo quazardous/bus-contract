@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.1
 
 - Docs: the reference implementation is `bus-kernel`'s `Kernel` (it
   moved out of `egui-pop-hooks`), with a `conformance` feature that
