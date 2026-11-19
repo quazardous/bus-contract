@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.4.4
+
+Additive: nothing changes for existing implementations or callers.
+
+- `Bus::capability(TypeId) -> Option<Provided<'_>>`, a typed capability
+  lookup keyed by the `TypeId` of the capability's trait object type
+  (`dyn Defer`, `dyn Timings`, `dyn Journal`, `dyn Relay`, or one the
+  core does not name). It returns `None` by default. `Provided` holds
+  the bus as `Any` and a `'static` cast (`Cast<C>`), so the lookup needs
+  no `unsafe` and `Bus` stays object safe.
+- `capability::<C, _>(&bus)` and `get::<C>()` on `dyn Bus` give
+  `Option<&C>`. A bus answering one `TypeId` with another capability's
+  cast gives `None`, never a wrong type.
+- `defer()`, `timings()`, `journal()` and `relay()` default to the
+  lookup, so a new implementation writes `capability` only. One that
+  overrides the getters keeps working through them, `offers` and
+  `declare_all`; its lookup answers `None` until it implements
+  `capability`. `Arc<B>` forwards `capability`.
+- `GUARANTEES.md`: `core.capability.lookup-agrees`, each capability
+  reached through its getter and the lookup with the same answer,
+  checked by `bus-kernel` 0.2.2 (`capability.getter_and_lookup_agree`).
+
 ## 0.4.3
 
 Docs only: no change to the traits or their behaviour.
