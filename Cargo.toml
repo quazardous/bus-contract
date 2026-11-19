@@ -1,6 +1,6 @@
 [package]
 name = "bus-contract"
-version = "0.4.5"
+version = "0.5.0"
 description = "A contract for a hook bus: libraries declare typed hook points and listen with named order (after, before, last), owners and deadlines; the application supplies the implementation and decides on one bus or several. No dependencies."
 readme = "README.md"
 keywords = ["event-bus", "hooks", "listeners", "plugins", "contract"]
@@ -15,6 +15,12 @@ exclude = ["crates/", ".github/", "RELEASING.md"]
 authors = ["The bus-contract contributors"]
 
 [dependencies]
+
+# The tests use the capability contracts; dev-dependencies by path only,
+# dropped from the published package.
+[dev-dependencies]
+bus-contract-defer = { path = "crates/defer" }
+bus-contract-timings = { path = "crates/timings" }
 
 # The repository is a workspace: `bus-contract` (the core, this package)
 # and one crate per capability contract under `crates/`, each versioned

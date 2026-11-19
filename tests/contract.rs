@@ -13,12 +13,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, ThreadId};
 
+use std::any::TypeId;
+
 use bus_contract::{
-    Altered, AnyInput, AnyListener, AnyLocalListener, AnyValue, Bus, Capability, CloneFn,
-    Collected, Defer, Failure, FailureKind, FailureSink, FreshFn, HookError, ListenOpts,
-    ListenerInfo, ListenerTimings, OverBudget, PendingRun, PendingWaker, Point, PointDecl,
-    PointInfo, PointKey, PointKind, PointSpec, PointTimings, Refusal, Refused, TimingStats,
-    Timings, declare_all, missing_targets, offers, order_dump,
+    Altered, AnyInput, AnyListener, AnyLocalListener, AnyValue, Bus, Cast, CloneFn, Collected,
+    Failure, FailureKind, FailureSink, FreshFn, HookError, ListenOpts, ListenerInfo, PendingRun,
+    PendingWaker, Point, PointDecl, PointId, PointInfo, PointKey, PointKind, PointSpec, Provided,
+    Refusal, Refused, declare_all, missing_targets, offers, order_dump,
+};
+use bus_contract_defer::{BusDefer, Defer};
+use bus_contract_timings::{
+    BusTimings, ListenerTimings, OverBudget, PointTimings, TimingStats, Timings,
 };
 
 thread_local! {
@@ -515,14 +520,20 @@ impl Bus for Recording {
         )
     }
 
-    fn defer(&self) -> Option<&dyn Defer> {
-        self.defers.then_some(self as &dyn Defer)
+    fn capability(&self, contract: TypeId) -> Option<Provided<'_>> {
+        (self.defers && contract == TypeId::of::<dyn Defer>())
+            .then(|| Provided::new::<dyn Defer>(self, &AS_DEFER))
     }
 }
 
+fn as_defer(bus: &dyn Any) -> Option<&(dyn Defer + 'static)> {
+    bus.downcast_ref::<Recording>().map(|b| b as _)
+}
+static AS_DEFER: Cast<dyn Defer> = as_defer;
+
 struct DocClose;
 impl Point for DocClose {
-    const ID: &'static str = "doc.close";
+    const ID: PointId = PointId::new("doc.close");
     const KIND: PointKind = PointKind::Request;
     type Input = String;
     type Value = Vec<String>;
@@ -530,7 +541,7 @@ impl Point for DocClose {
 
 struct Findings;
 impl Point for Findings {
-    const ID: &'static str = "doc.findings";
+    const ID: PointId = PointId::new("doc.findings");
     type Input = ();
     type Value = Vec<String>;
 }
@@ -795,7 +806,7 @@ fn forget_removes_local_listeners_queued_or_not() {
 /// A command run, as a request whose listeners may refuse it.
 struct CommandRun;
 impl Point for CommandRun {
-    const ID: &'static str = "command.run";
+    const ID: PointId = PointId::new("command.run");
     const KIND: PointKind = PointKind::Request;
     type Input = String;
     type Value = Vec<String>;
@@ -804,7 +815,7 @@ impl Point for CommandRun {
 /// The same request, declared fail-closed.
 struct GuardedRun;
 impl Point for GuardedRun {
-    const ID: &'static str = "command.guarded";
+    const ID: PointId = PointId::new("command.guarded");
     const KIND: PointKind = PointKind::Request;
     type Input = String;
     type Value = Vec<String>;
@@ -813,7 +824,7 @@ impl Point for GuardedRun {
 /// A request heard after the current pass.
 struct LibraryWrite;
 impl Point for LibraryWrite {
-    const ID: &'static str = "library.write";
+    const ID: PointId = PointId::new("library.write");
     const KIND: PointKind = PointKind::Request;
     type Input = String;
     type Value = Vec<String>;
@@ -827,7 +838,7 @@ const COMMAND_POINTS: &[PointDecl] = &[
 const LIBRARY_POINTS: &[PointDecl] =
     &[
         PointDecl::of::<LibraryWrite>("A library write, heard after drawing.")
-            .needs(&[Capability::Defer]),
+            .needs(&[&bus_contract_defer::CONTRACT]),
     ];
 
 /// Three listeners in order: `policy`, `audit`, `handler`; `policy`
@@ -1019,27 +1030,27 @@ fn a_refusal_stops_local_listeners_too() {
 fn a_point_needing_a_missing_capability_is_refused() {
     let bus = bus();
     assert!(bus.defer().is_none());
-    assert!(!offers(&*bus, Capability::Defer));
+    assert!(!offers(&*bus, &bus_contract_defer::CONTRACT));
     let refused = declare_all(&*bus, LIBRARY_POINTS);
     assert_eq!(
         refused,
         [Refused::Unsupported {
             point: "library.write",
-            capability: Capability::Defer
+            contract: "defer"
         }]
     );
     assert_eq!(
         refused[0].to_string(),
-        "hook `library.write` needs the `defer` capability, which this bus does not offer"
+        "hook `library.write` needs the `defer` contract, which this bus does not offer"
     );
     assert!(bus.points().is_empty(), "not declared");
 
     let bus: Arc<dyn Bus> = Arc::new(Recording::with_defer());
-    assert!(offers(&*bus, Capability::Defer));
+    assert!(offers(&*bus, &bus_contract_defer::CONTRACT));
     assert!(declare_all(&*bus, LIBRARY_POINTS).is_empty());
     // Through `Arc<B>` too.
     let shared = Arc::new(Recording::with_defer());
-    assert!(Bus::defer(&shared).is_some());
+    assert!(BusDefer::defer(&shared).is_some());
 }
 
 /// Asks are queued, run at the drain in ask order with every listener,
@@ -1167,13 +1178,16 @@ fn a_budget_reaches_the_spec_and_needs_no_capability() {
     let recording = Arc::new(Recording::default());
     let bus: Arc<dyn Bus> = recording.clone();
     assert!(bus.timings().is_none());
-    assert!(!offers(&*bus, Capability::Timings));
-    assert!(Bus::timings(&recording).is_none(), "through `Arc<B>`");
+    assert!(!offers(&*bus, &bus_contract_timings::CONTRACT));
+    assert!(
+        BusTimings::timings(&recording).is_none(),
+        "through `Arc<B>`"
+    );
     assert!(declare_all(&*bus, TABLE).is_empty());
     let points = recording.points.lock().unwrap();
     let spec = points[0].1.as_ref().unwrap();
     assert_eq!(spec.budget, Some(std::time::Duration::from_millis(4)));
-    assert_eq!(Capability::Timings.as_str(), "timings");
+    assert_eq!(bus_contract_timings::CONTRACT.name, "timings");
 }
 
 /// The timing types: the mean, the slowest listeners first, and a pass
@@ -1221,7 +1235,7 @@ fn timing_types_read_the_slowest_first() {
 #[test]
 fn on_over_budget_adds_a_sink() {
     #[derive(Default)]
-    struct Sinks(Mutex<Vec<bus_contract::BudgetSink>>);
+    struct Sinks(Mutex<Vec<bus_contract_timings::BudgetSink>>);
     impl Timings for Sinks {
         fn points(&self) -> Vec<PointTimings> {
             Vec::new()
@@ -1230,7 +1244,7 @@ fn on_over_budget_adds_a_sink() {
             None
         }
         fn reset(&self) {}
-        fn add_budget_sink(&self, sink: bus_contract::BudgetSink) {
+        fn add_budget_sink(&self, sink: bus_contract_timings::BudgetSink) {
             self.0.lock().unwrap().push(sink);
         }
     }

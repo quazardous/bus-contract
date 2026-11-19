@@ -2,46 +2,29 @@
 //! library's table, the order dump and the missing targets a test ends
 //! without.
 
-use crate::{Bus, LAST, PointDecl, PointKind, Refused, offers};
+use crate::{Bus, LAST, PointDecl, Refused, offers};
 
 /// Declares every point of a library's contract table on `bus`; the
 /// refusals, in table order, each point refused left undeclared:
 ///
 /// - a point already declared (another library, or a second application
 ///   on the same bus);
-/// - a point that needs a capability the bus does not offer
-///   ([`Refused::Unsupported`]): those it names, the journal for a
-///   journaled point, the relay for a relayable one
-///   ([`PointDecl::required`]);
-/// - a journaled point that is not an event ([`Refused::NotEvent`]);
-/// - a relayable point that cannot cross: an alter or collect point, a
-///   request whose codec writes no value ([`Refused::NotCrossable`]);
-/// - a relayable point with another point's codec
-///   ([`Refused::TypeMismatch`]).
+/// - a point that needs a capability contract the bus does not offer
+///   ([`Refused::Unsupported`]): those it names and those of its facets
+///   ([`PointDecl::required`]), with the contracts they require
+///   ([`offers`](crate::offers));
+/// - whatever the bus refuses at declaration: an id that breaks the
+///   naming rule ([`Refused::BadId`]), a facet its contract refuses
+///   ([`Refused::Contract`]: a journaled point that is not an event, a
+///   relayable point that cannot cross or carries another point's codec).
 pub fn declare_all(bus: &dyn Bus, table: &[PointDecl]) -> Vec<Refused> {
     table
         .iter()
         .filter_map(|d| {
-            if d.journaled && d.kind != PointKind::Event {
-                return Some(Refused::NotEvent { point: d.id });
-            }
-            if let Some(codec) = d.relay {
-                if codec.point != d.id {
-                    return Some(Refused::TypeMismatch { point: d.id });
-                }
-                let crosses = match d.kind {
-                    PointKind::Event => true,
-                    PointKind::Request => codec.answers(),
-                    _ => false,
-                };
-                if !crosses {
-                    return Some(Refused::NotCrossable { point: d.id });
-                }
-            }
-            if let Some(capability) = d.required().into_iter().find(|c| !offers(bus, *c)) {
+            if let Some(contract) = d.required().into_iter().find(|c| !offers(bus, c)) {
                 return Some(Refused::Unsupported {
-                    point: d.id,
-                    capability,
+                    point: d.id.as_str(),
+                    contract: contract.name,
                 });
             }
             bus.declare_point(d.key(), d.spec()).err()

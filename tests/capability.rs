@@ -1,17 +1,19 @@
-//! The capability lookup (`Bus::capability`) and the getters agree both
-//! ways: a bus written before the lookup, which overrides only the
-//! getters, and a bus that implements only `capability`.
+//! The capability lookup (`Bus::capability`): a bus that implements it
+//! answers through the typed lookup, the contract crates' extension
+//! traits and `offers`, and a faulty cast gives `None`, never a wrong
+//! type.
 
 use std::any::{Any, TypeId};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bus_contract::{
-    Altered, AnyInput, AnyListener, AnyLocalListener, AnyValue, Bus, Capability, Cast, CloneFn,
-    Collected, Defer, FailureSink, FreshFn, Journal, ListenOpts, ListenerInfo, PendingRun,
-    PendingWaker, Point, PointDecl, PointInfo, PointKey, PointSpec, Provided, Refused, Relay,
-    Timings, capability, declare_all, offers,
+    Altered, AnyInput, AnyListener, AnyLocalListener, AnyValue, Bus, Cast, CloneFn, Collected,
+    FailureSink, FreshFn, ListenOpts, ListenerInfo, PendingRun, PendingWaker, Point, PointDecl,
+    PointId, PointInfo, PointKey, PointSpec, Provided, Refused, capability, declare_all, offers,
 };
+use bus_contract_defer::{BusDefer, Defer};
+use bus_contract_timings::{BusTimings, Timings};
 
 /// The core methods, which these tests never call.
 macro_rules! core_unused {
@@ -86,19 +88,6 @@ macro_rules! counting_defer {
     };
 }
 
-/// A bus written before the lookup: it overrides the `defer` getter.
-#[derive(Default)]
-struct GetterOnly {
-    asks: AtomicU64,
-}
-counting_defer!(GetterOnly);
-impl Bus for GetterOnly {
-    core_unused!();
-    fn defer(&self) -> Option<&dyn Defer> {
-        Some(self)
-    }
-}
-
 /// A bus written for the lookup: it implements `capability` only.
 #[derive(Default)]
 struct LookupOnly {
@@ -117,25 +106,25 @@ impl Bus for LookupOnly {
     }
 }
 
-/// A faulty bus: it answers the `Journal` id with its `Defer` cast.
+/// A faulty bus: it answers the `Timings` id with its `Defer` cast.
 struct Mismatched(LookupOnly);
 impl Bus for Mismatched {
     core_unused!();
     fn capability(&self, contract: TypeId) -> Option<Provided<'_>> {
-        (contract == TypeId::of::<dyn Journal>())
+        (contract == TypeId::of::<dyn Timings>())
             .then(|| Provided::new::<dyn Defer>(&self.0, &LOOKUP_AS_DEFER))
     }
 }
 
 struct Write;
 impl Point for Write {
-    const ID: &'static str = "test.write.asked";
+    const ID: PointId = PointId::new("test.write.asked");
     type Input = ();
     type Value = u32;
 }
 
 const NEEDS_DEFER: &[PointDecl] =
-    &[PointDecl::of::<Write>("A write asked for later.").needs(&[Capability::Defer])];
+    &[PointDecl::of::<Write>("A write asked for later.").needs(&[&bus_contract_defer::CONTRACT])];
 
 /// The address of the object a reference points at, to compare two
 /// trait objects found by different routes.
@@ -144,40 +133,33 @@ fn addr<T: ?Sized>(r: &T) -> *const () {
 }
 
 #[test]
-fn a_bus_overriding_only_the_getters_keeps_working() {
-    let bus: Arc<dyn Bus> = Arc::new(GetterOnly::default());
-    let defer = bus.defer().expect("the getter answers");
-    assert_eq!(defer.ask::<Write>((), 1), 1);
-    assert!(offers(&*bus, Capability::Defer));
-    assert!(!offers(&*bus, Capability::Journal));
-    assert!(declare_all(&*bus, NEEDS_DEFER).is_empty());
-    // The other getters keep their `None` default.
-    assert!(bus.timings().is_none() && bus.journal().is_none() && bus.relay().is_none());
-    // The lookup knows nothing it was not told.
-    assert!(bus.get::<dyn Defer>().is_none());
-}
-
-#[test]
-fn a_bus_implementing_only_the_lookup_answers_through_the_getters() {
+fn a_bus_implementing_the_lookup_answers_through_the_extension_trait() {
     let bus: Arc<dyn Bus> = Arc::new(LookupOnly::default());
-    let by_getter = bus.defer().expect("the getter defaults to the lookup");
+    let by_trait = bus
+        .defer()
+        .expect("the extension trait goes through the lookup");
     let by_lookup = bus.get::<dyn Defer>().expect("the lookup answers");
-    assert_eq!(addr(by_getter), addr(by_lookup));
-    assert_eq!(by_getter.ask::<Write>((), 1), 1);
+    assert_eq!(addr(by_trait), addr(by_lookup));
+    assert_eq!(by_trait.ask::<Write>((), 1), 1);
     assert_eq!(by_lookup.ask::<Write>((), 1), 2);
-    assert!(offers(&*bus, Capability::Defer));
-    assert!(!offers(&*bus, Capability::Timings));
+    assert!(offers(&*bus, &bus_contract_defer::CONTRACT));
+    assert!(!offers(&*bus, &bus_contract_timings::CONTRACT));
     assert!(declare_all(&*bus, NEEDS_DEFER).is_empty());
-    assert!(bus.timings().is_none() && bus.journal().is_none() && bus.relay().is_none());
+    assert!(bus.timings().is_none());
     assert!(bus.get::<dyn Timings>().is_none());
-    assert!(bus.get::<dyn Relay>().is_none());
 }
 
 #[test]
 fn a_bus_without_the_capability_refuses_the_point() {
     let bus: Arc<dyn Bus> = Arc::new(Mismatched(LookupOnly::default()));
     let refused = declare_all(&*bus, NEEDS_DEFER);
-    assert!(matches!(refused.as_slice(), [Refused::Unsupported { .. }]));
+    assert_eq!(
+        refused,
+        [Refused::Unsupported {
+            point: "test.write.asked",
+            contract: "defer"
+        }]
+    );
 }
 
 #[test]
@@ -200,8 +182,7 @@ fn the_typed_lookup_works_on_concrete_and_shared_buses() {
 #[test]
 fn a_cast_of_another_capability_gives_none_not_a_wrong_type() {
     let bus: Arc<dyn Bus> = Arc::new(Mismatched(LookupOnly::default()));
-    assert!(bus.capability(TypeId::of::<dyn Journal>()).is_some());
-    assert!(bus.get::<dyn Journal>().is_none());
-    assert!(bus.journal().is_none());
-    assert!(!offers(&*bus, Capability::Journal));
+    assert!(bus.capability(TypeId::of::<dyn Timings>()).is_some());
+    assert!(bus.get::<dyn Timings>().is_none());
+    assert!(bus.timings().is_none());
 }

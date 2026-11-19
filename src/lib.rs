@@ -2,7 +2,8 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-mod journal;
+mod contract;
+mod ids;
 mod tools;
 mod types;
 
@@ -17,11 +18,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-pub use journal::{
-    Answer, Authority, Codec, Crossing, Cursor, DecodeFn, DecodeValueFn, EncodeFn, EncodeValueFn,
-    IngestError, Journal, JournalEntry, Lost, Origin, Relay, Relayed, RelayedAnswer, RelayedAsk,
-    RelayedEntry, RelayedRequest, Resumed, Since, ask_run, far_listener, kind_matches,
-};
+pub use contract::{Contract, Facet, offers};
+pub use ids::{IdError, ListenerId, PointId, check_id};
 pub use tools::{declare_all, missing_targets, order_dump};
 pub use types::*;
 
@@ -44,7 +42,7 @@ impl PointKey {
     /// The key of the point `P`.
     pub fn of<P: Point>() -> PointKey {
         PointKey {
-            id: P::ID,
+            id: P::ID.as_str(),
             kind: P::KIND,
             type_id: TypeId::of::<P>(),
             type_name: type_name::<P>(),
@@ -87,9 +85,6 @@ pub type FreshFn = fn() -> AnyValue;
 /// Receives each failure that dropped a contribution
 /// ([`Failure::dropped`]).
 pub type FailureSink = Arc<dyn Fn(&Failure) + Send + Sync>;
-
-/// Receives each pass over a point's budget ([`OverBudget`]).
-pub type BudgetSink = Arc<dyn Fn(&OverBudget) + Send + Sync>;
 
 /// The bus contract: hook points, their listeners in a declared order,
 /// emits and introspection. An application supplies one implementation
@@ -137,13 +132,21 @@ pub type BudgetSink = Arc<dyn Fn(&OverBudget) + Send + Sync>;
 ///   ignored.
 ///
 /// Capabilities: an implementation may offer more than this core, each
-/// as a trait of its own found at run time through a provided method
-/// that returns `None` by default ([`Bus::defer`], [`Bus::timings`],
-/// [`Bus::journal`], [`Bus::relay`]). A library that needs
-/// one names it in its contract table ([`PointDecl::needs`]);
-/// [`declare_all`] then refuses the point on a bus without it
-/// ([`Refused::Unsupported`]). A library that can do without checks the
-/// method and falls back.
+/// a contract of its own, defined in a crate of its own
+/// (`bus-contract-defer`, `-timings`, `-journal`, `-crossing`) and found
+/// at run time through [`Bus::capability`], which returns `None` by
+/// default. Each contract crate adds the typed call on every bus
+/// (`use bus_contract_journal::BusJournal;` then `bus.journal()`). A
+/// library that needs one names its [`Contract`] in its table
+/// ([`PointDecl::needs`]), or a [`Facet`] of it
+/// ([`PointDecl::facets`]); [`declare_all`] then refuses the point on a
+/// bus without it ([`Refused::Unsupported`]). A library that can do
+/// without checks the call and falls back.
+///
+/// Ids: a point's id is a [`PointId`], checked when made; a listener's
+/// id is checked by the bus when it registers ([`Refused::BadId`]), and
+/// a point key whose id breaks the rule is refused at declaration
+/// ([`check_id`]).
 ///
 /// Local listeners ([`Bus::listen_local_any`]) are for state that is not
 /// `Send` (`Rc`, `RefCell`), such as an interface's. Each is bound to the
@@ -247,17 +250,9 @@ pub trait Bus: Send + Sync {
     /// `bus.get::<dyn Journal>()` on a `dyn Bus`).
     ///
     /// This is how a bus offers a capability whose trait the core does
-    /// not name: an extension contract defines its trait, a bus answers
-    /// for its `TypeId`, and a library reaches it through [`capability`].
-    /// The four getters below ([`Bus::defer`], [`Bus::timings`],
-    /// [`Bus::journal`], [`Bus::relay`]) default to this lookup, so a
-    /// new implementation writes `capability` only.
-    ///
-    /// An implementation that overrides the getters and not this method
-    /// keeps working through the getters, [`offers`] and [`declare_all`],
-    /// but the lookup does not see those capabilities. One that writes
-    /// both answers the same through each: a getter and the lookup give
-    /// `Some` together, and the same object.
+    /// not name: an extension contract defines its trait and its
+    /// [`Contract`], a bus answers for its `TypeId`, and a library reaches
+    /// it through [`capability`] or the contract crate's extension trait.
     ///
     /// ```
     /// use std::any::{Any, TypeId};
@@ -280,40 +275,6 @@ pub trait Bus: Send + Sync {
     fn capability(&self, contract: TypeId) -> Option<Provided<'_>> {
         let _ = contract;
         None
-    }
-
-    /// The [`Defer`] capability: requests asked now, heard at the next
-    /// drain on the same thread. `None` when the implementation does not
-    /// offer it. By default, what [`Bus::capability`] answers for
-    /// `dyn Defer`.
-    fn defer(&self) -> Option<&dyn Defer> {
-        capability::<dyn Defer, Self>(self)
-    }
-
-    /// The [`Timings`] capability: how long listeners take, per point and
-    /// listener, and passes over a point's budget reported. `None` when
-    /// the implementation does not offer it. By default, what
-    /// [`Bus::capability`] answers for `dyn Timings`.
-    fn timings(&self) -> Option<&dyn Timings> {
-        capability::<dyn Timings, Self>(self)
-    }
-
-    /// The [`Journal`] capability: events of journaled points kept with a
-    /// number, read again from one, delivered after the publisher has
-    /// moved on. `None` when the implementation does not offer it. By
-    /// default, what [`Bus::capability`] answers for `dyn Journal`.
-    fn journal(&self) -> Option<&dyn Journal> {
-        capability::<dyn Journal, Self>(self)
-    }
-
-    /// The [`Relay`] capability: events of relayable points served to
-    /// another process from a cursor and taken in from one, asks of
-    /// relayable requests answered for one. `None` when the
-    /// implementation does not offer it; a bus that offers it offers
-    /// [`Bus::journal`]. By default, what [`Bus::capability`] answers for
-    /// `dyn Relay`.
-    fn relay(&self) -> Option<&dyn Relay> {
-        capability::<dyn Relay, Self>(self)
     }
 }
 
@@ -369,120 +330,6 @@ impl<'a> dyn Bus + 'a {
     /// `dyn Journal` ([`capability`]).
     pub fn get<C: ?Sized + 'static>(&self) -> Option<&C> {
         capability::<C, Self>(self)
-    }
-}
-
-/// Whether `bus` offers `capability`.
-pub fn offers(bus: &dyn Bus, capability: Capability) -> bool {
-    match capability {
-        Capability::Defer => bus.defer().is_some(),
-        Capability::Timings => bus.timings().is_some(),
-        Capability::Journal => bus.journal().is_some(),
-        Capability::Relay => bus.relay().is_some() && bus.journal().is_some(),
-    }
-}
-
-/// A capability of a bus ([`Bus::timings`]): how long listeners take,
-/// per point and per listener, and the passes over a point's budget
-/// ([`PointSpec::budget`]) reported as they happen.
-///
-/// A pass is what the listeners of one emit ran on one thread: the
-/// inline part of an alter or collect emit, one emit's local listeners
-/// run by [`Bus::run_pending`], or one ask run by [`Defer::drain`]. Its
-/// time is its listeners' times added up.
-///
-/// What an implementation promises:
-///
-/// - Every listener run it makes is timed, whatever its outcome (a
-///   threaded listener that misses its deadline counts the time the
-///   emit waited), and counted in the listener's and the pass's
-///   [`TimingStats`] until [`Timings::reset`].
-/// - A pass of a point with a budget that takes longer is reported to
-///   the budget sinks, on the thread that ran it, after the pass, with
-///   each listener's time ([`OverBudget`]). The pass's results are kept:
-///   a budget is not a deadline, and a pass over it is not a failure.
-/// - Quantiles may be approximate; counts, totals and maxima are exact.
-/// - Timing costs little next to a listener: clock reads and counters,
-///   no allocation per run.
-pub trait Timings: Send + Sync {
-    /// Every point that ran a pass since the last reset, in id order.
-    fn points(&self) -> Vec<PointTimings>;
-
-    /// The timings of the point `point`; `None` when it ran no pass
-    /// since the last reset.
-    fn point(&self, point: &str) -> Option<PointTimings>;
-
-    /// Starts a new window: every count back to zero (after a start-up
-    /// phase, before a measured run).
-    fn reset(&self);
-
-    /// Adds a sink called with each pass over its point's budget, on the
-    /// thread that ran it: where the host publishes its
-    /// [`OVER_BUDGET_FACT`] fact or logs. A sink that panics is ignored.
-    fn add_budget_sink(&self, sink: BudgetSink);
-}
-
-impl<'a> dyn Timings + 'a {
-    /// Adds a sink called with each pass over its point's budget
-    /// ([`Timings::add_budget_sink`]).
-    pub fn on_over_budget(&self, sink: impl Fn(&OverBudget) + Send + Sync + 'static) {
-        self.add_budget_sink(Arc::new(sink));
-    }
-}
-
-/// A capability of a bus ([`Bus::defer`]): a request asked now, whose
-/// listeners run at the bus's next drain on the same thread.
-///
-/// It is for code that cannot be re-entered while it runs, such as an
-/// interface drawing a panel with its state borrowed: the panel asks,
-/// and the listeners run after the drawing, when the host calls
-/// [`Defer::drain`].
-///
-/// What an implementation promises:
-///
-/// - An ask is queued for the calling thread and returns at once with
-///   its number, increasing in ask order across the bus. The wakers
-///   ([`Bus::add_pending_waker`]) are called with the thread's id.
-/// - [`Defer::drain`] runs the asks queued for the calling thread, in
-///   ask order, each as an alter emit of its point with the listeners
-///   registered when it runs (one removed since the ask does not run;
-///   one added since does). Every rule of [`Bus`] holds, refusals and
-///   fail-closed points included; a local listener of another thread is
-///   queued for that thread's [`Bus::run_pending`] as usual.
-/// - Each ask's outcome is reported by the drain ([`PendingRun`], with
-///   [`PendingRun::ask`] set): the listeners that ran, their failures,
-///   a refusal. The asker gets nothing back; a listener placed last
-///   ([`ListenOpts::last`]) reads the final value.
-/// - An ask made during a drain (by a listener) waits for the next one.
-/// - An immediate emit made after an ask, before the drain, runs before
-///   it.
-pub trait Defer: Send + Sync {
-    /// Queues an alter emit of `point` with `input` and `value` for the
-    /// calling thread's next [`Defer::drain`]; the ask's number.
-    fn ask_any(&self, point: PointKey, input: AnyInput, value: AnyValue, clone: CloneFn) -> u64;
-
-    /// Runs the asks queued for the calling thread, in ask order; what
-    /// each did. Empty when nothing waits.
-    fn drain(&self) -> Vec<PendingRun>;
-
-    /// How many asks wait for the calling thread's drain (zero before a
-    /// clean exit).
-    fn waiting(&self) -> usize;
-}
-
-impl<'a> dyn Defer + 'a {
-    /// Asks the request `P` now: its listeners run at the calling
-    /// thread's next [`Defer::drain`]. The ask's number.
-    pub fn ask<P: Point>(&self, input: P::Input, value: P::Value) -> u64
-    where
-        P::Value: Clone,
-    {
-        self.ask_any(
-            PointKey::of::<P>(),
-            Arc::new(input),
-            Box::new(value),
-            clone_value::<P::Value>,
-        )
     }
 }
 
@@ -558,26 +405,12 @@ impl<B: Bus + ?Sized> Bus for Arc<B> {
     fn capability(&self, contract: TypeId) -> Option<Provided<'_>> {
         (**self).capability(contract)
     }
-
-    fn defer(&self) -> Option<&dyn Defer> {
-        (**self).defer()
-    }
-
-    fn timings(&self) -> Option<&dyn Timings> {
-        (**self).timings()
-    }
-
-    fn journal(&self) -> Option<&dyn Journal> {
-        (**self).journal()
-    }
-
-    fn relay(&self) -> Option<&dyn Relay> {
-        (**self).relay()
-    }
 }
 
-/// Copies an erased value of type `V`.
-fn clone_value<V: Clone + Send + 'static>(value: &(dyn Any + Send)) -> AnyValue {
+/// Copies an erased value of type `V`: the [`CloneFn`] of a point whose
+/// value is `V`. Panics when the value is another type (a defect of the
+/// implementation).
+pub fn clone_value<V: Clone + Send + 'static>(value: &(dyn Any + Send)) -> AnyValue {
     match value.downcast_ref::<V>() {
         Some(v) => Box::new(v.clone()),
         None => panic!(
@@ -587,8 +420,9 @@ fn clone_value<V: Clone + Send + 'static>(value: &(dyn Any + Send)) -> AnyValue 
     }
 }
 
-/// A fresh erased value of type `V`.
-fn fresh_value<V: Default + Send + 'static>() -> AnyValue {
+/// A fresh erased value of type `V`: the [`FreshFn`] of a point whose
+/// value is `V`.
+pub fn fresh_value<V: Default + Send + 'static>() -> AnyValue {
     Box::new(V::default())
 }
 
@@ -750,10 +584,23 @@ pub fn erase_local<P: Point>(
 /// from the point's type in a `const` (`PointDecl::of::<DocClose>(…)`),
 /// so the application can read what a library will host before building
 /// anything. [`declare_all`] declares a table on a bus.
+///
+/// What a point needs from a capability contract is data of that
+/// contract, made by its crate in a `const`: a [`Contract`] in
+/// [`PointDecl::needs`], a [`Facet`] in [`PointDecl::facets`]:
+///
+/// ```ignore
+/// const CODEC: Codec = Codec::of::<DocChanged>();
+/// const TABLE: &[PointDecl] = &[
+///     PointDecl::of::<DocAsk>("asked after the frame").needs(&[&bus_contract_defer::CONTRACT]),
+///     PointDecl::of::<DocChanged>("a document changed")
+///         .facets(&[bus_contract_journal::JOURNALED, bus_contract_crossing::relayable(&CODEC)]),
+/// ];
+/// ```
 #[derive(Clone, Copy, Debug)]
 pub struct PointDecl {
     /// The point's id.
-    pub id: &'static str,
+    pub id: PointId,
     /// What it is for.
     pub kind: PointKind,
     /// What it does, for people and agents reading introspection.
@@ -764,17 +611,15 @@ pub struct PointDecl {
     /// Whether a listener failure refuses the request
     /// ([`PointSpec::fail_closed`]).
     pub fail_closed: bool,
-    /// The capabilities the point needs from the bus: [`declare_all`]
-    /// refuses it on a bus without them.
-    pub needs: &'static [Capability],
+    /// The contracts the point needs from the bus, besides those of its
+    /// facets: [`declare_all`] refuses it on a bus without them.
+    pub needs: &'static [&'static Contract],
+    /// What its declaration says for capability contracts
+    /// ([`PointSpec::facets`]); each needs its contract.
+    pub facets: &'static [Facet],
     /// The time one pass of its listeners should take
     /// ([`PointSpec::budget`]).
     pub budget: Option<Duration>,
-    /// Its events go through the bus's journal ([`PointSpec::journaled`]).
-    pub journaled: bool,
-    /// How it crosses a process, when it is relayable
-    /// ([`PointSpec::relay`]).
-    pub relay: Option<Codec>,
     /// Its version, from 1 ([`PointSpec::version`]).
     pub version: u32,
     key: fn() -> PointKey,
@@ -790,9 +635,8 @@ impl PointDecl {
             deadline: None,
             fail_closed: false,
             needs: &[],
+            facets: &[],
             budget: None,
-            journaled: false,
-            relay: None,
             version: 1,
             key: PointKey::of::<P>,
         }
@@ -811,52 +655,27 @@ impl PointDecl {
         self
     }
 
-    /// The capabilities the point needs from the bus
-    /// (`.needs(&[Capability::Defer])`).
-    pub const fn needs(mut self, needs: &'static [Capability]) -> PointDecl {
+    /// The contracts the point needs from the bus
+    /// (`.needs(&[&bus_contract_defer::CONTRACT])`).
+    pub const fn needs(mut self, needs: &'static [&'static Contract]) -> PointDecl {
         self.needs = needs;
+        self
+    }
+
+    /// What its declaration says for capability contracts
+    /// (`.facets(&[bus_contract_journal::JOURNALED])`); each facet's
+    /// contract is needed.
+    pub const fn facets(mut self, facets: &'static [Facet]) -> PointDecl {
+        self.facets = facets;
         self
     }
 
     /// The time one pass of its listeners should take
     /// ([`PointSpec::budget`]); reported when over, never failed. It
-    /// needs no capability: on a bus without [`Timings`] it is only
-    /// shown.
+    /// needs no capability: on a bus without the timings contract it is
+    /// only shown.
     pub const fn budget(mut self, budget: Duration) -> PointDecl {
         self.budget = Some(budget);
-        self
-    }
-
-    /// Its events go through the bus's journal: published with a number,
-    /// delivered after the publisher has moved on ([`Journal`]). For an
-    /// event point; [`declare_all`] refuses it on a bus without the
-    /// journal ([`Refused::Unsupported`]) and on another kind
-    /// ([`Refused::NotEvent`]).
-    pub const fn journaled(mut self) -> PointDecl {
-        self.journaled = true;
-        self
-    }
-
-    /// The point crosses processes ([`Relay`]):
-    ///
-    /// - an event point's events, their input written and read by
-    ///   `codec` ([`Codec::of::<P>()`](Codec::of)); journaled too;
-    /// - a request point's asks, from another process, their input and
-    ///   value written and read by `codec`
-    ///   ([`Codec::request::<P>()`](Codec::request)); fail-closed too, so
-    ///   no answer in time is a refusal.
-    ///
-    /// [`declare_all`] refuses it on a bus without the relay
-    /// ([`Refused::Unsupported`]), on an alter or collect point and on a
-    /// request whose codec has no value ([`Refused::NotCrossable`]), and
-    /// with a codec of another point ([`Refused::TypeMismatch`]).
-    pub const fn relayable(mut self, codec: Codec) -> PointDecl {
-        match self.kind {
-            PointKind::Event => self.journaled = true,
-            PointKind::Request => self.fail_closed = true,
-            _ => {}
-        }
-        self.relay = Some(codec);
         self
     }
 
@@ -868,16 +687,19 @@ impl PointDecl {
         self
     }
 
-    /// The capabilities the point needs: those it names
-    /// ([`PointDecl::needs`]), then [`Capability::Journal`] when it is
-    /// journaled and [`Capability::Relay`] when it is relayable.
-    pub fn required(&self) -> Vec<Capability> {
-        let mut all = self.needs.to_vec();
-        if self.journaled && !all.contains(&Capability::Journal) {
-            all.push(Capability::Journal);
-        }
-        if self.relay.is_some() && !all.contains(&Capability::Relay) {
-            all.push(Capability::Relay);
+    /// The contracts the point needs: those it names
+    /// ([`PointDecl::needs`]), then those of its facets, each once.
+    pub fn required(&self) -> Vec<&'static Contract> {
+        let mut all: Vec<&'static Contract> = Vec::new();
+        for c in self
+            .needs
+            .iter()
+            .copied()
+            .chain(self.facets.iter().map(|f| f.contract))
+        {
+            if !all.contains(&c) {
+                all.push(c);
+            }
         }
         all
     }
@@ -893,8 +715,7 @@ impl PointDecl {
         spec.deadline = self.deadline;
         spec.fail_closed = self.fail_closed;
         spec.budget = self.budget;
-        spec.journaled = self.journaled;
-        spec.relay = self.relay;
+        spec.facets = self.facets.to_vec();
         spec.version = self.version;
         spec
     }

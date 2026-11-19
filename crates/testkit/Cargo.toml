@@ -9,3 +9,7 @@ license.workspace = true
 
 [dependencies]
 bus-contract = { path = "../.." }
+bus-contract-defer = { path = "../defer" }
+bus-contract-timings = { path = "../timings" }
+bus-contract-journal = { path = "../journal" }
+bus-contract-crossing = { path = "../crossing" }

@@ -1,20 +1,23 @@
 //! Test buses for the workspace's tests: a bus that offers the
-//! capabilities it is told to through `Bus::capability` only
-//! ([`LookupBus`]), and one written before the lookup that overrides
-//! the getters only ([`GetterBus`]). Their capability methods do the
-//! least that lets a test tell which object answered.
+//! capabilities it is told to through `Bus::capability`
+//! ([`LookupBus`]). Its capability methods do the least that lets a
+//! test tell which object answered.
 
 use std::any::{Any, TypeId};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use bus_contract::{
-    Altered, AnyInput, AnyListener, AnyLocalListener, AnyValue, Authority, BudgetSink, Bus, Cast,
-    CloneFn, Collected, Cursor, Defer, FailureSink, FreshFn, IngestError, Journal, JournalEntry,
-    ListenOpts, ListenerInfo, Origin, PendingRun, PendingWaker, PointInfo, PointKey, PointSpec,
-    PointTimings, Provided, Refused, Relay, RelayedAnswer, RelayedAsk, RelayedEntry, Resumed,
-    Since, Timings,
+    Altered, AnyInput, AnyListener, AnyLocalListener, AnyValue, Bus, Cast, CloneFn, Collected,
+    FailureSink, FreshFn, ListenOpts, ListenerInfo, PendingRun, PendingWaker, PointInfo, PointKey,
+    PointSpec, Provided, Refused,
 };
+use bus_contract_crossing::{
+    Authority, Cursor, IngestError, Origin, Relay, RelayedAnswer, RelayedAsk, RelayedEntry, Resumed,
+};
+use bus_contract_defer::Defer;
+use bus_contract_journal::{Journal, JournalEntry, Since};
+use bus_contract_timings::{BudgetSink, PointTimings, Timings};
 
 /// Which capabilities a test bus offers.
 #[derive(Clone, Copy, Debug, Default)]
@@ -46,7 +49,7 @@ impl Offers {
     };
 }
 
-/// The capability methods, shared by both buses: each counts its calls
+/// The capability methods: each counts its calls
 /// in `calls`, so a test can see the object answering is this bus.
 #[derive(Default)]
 pub struct Parts {
@@ -225,42 +228,6 @@ impl Bus for LookupBus {
         } else {
             None
         }
-    }
-}
-
-/// A bus written before the lookup: it overrides the four getters and
-/// leaves `Bus::capability` at its `None` default.
-#[derive(Default)]
-pub struct GetterBus {
-    /// What it offers.
-    pub offers: Offers,
-    /// Its capability methods.
-    pub parts: Parts,
-}
-
-impl GetterBus {
-    /// A bus offering `offers`.
-    pub fn new(offers: Offers) -> GetterBus {
-        GetterBus {
-            offers,
-            parts: Parts::default(),
-        }
-    }
-}
-
-impl Bus for GetterBus {
-    core_unused!();
-    fn defer(&self) -> Option<&dyn Defer> {
-        self.offers.defer.then_some(&self.parts as _)
-    }
-    fn timings(&self) -> Option<&dyn Timings> {
-        self.offers.timings.then_some(&self.parts as _)
-    }
-    fn journal(&self) -> Option<&dyn Journal> {
-        self.offers.journal.then_some(&self.parts as _)
-    }
-    fn relay(&self) -> Option<&dyn Relay> {
-        self.offers.relay.then_some(&self.parts as _)
     }
 }
 

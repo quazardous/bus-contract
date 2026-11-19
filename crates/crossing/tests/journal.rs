@@ -12,14 +12,22 @@ use std::time::{Duration, Instant};
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
+use std::any::{Any, TypeId};
+
 use bus_contract::{
-    Altered, Answer, AnyInput, AnyListener, AnyLocalListener, AnyValue, Authority, Bus, Capability,
-    CloneFn, Codec, Collected, Crossing, Cursor, Failure, FailureKind, FailureSink, FreshFn,
-    HookError, IngestError, Journal, JournalEntry, ListenOpts, ListenerInfo, Lost, Origin,
-    PendingRun, PendingWaker, Point, PointDecl, PointInfo, PointKey, PointKind, PointSpec, Refusal,
-    Refused, Relay, Relayed, RelayedAnswer, RelayedAsk, RelayedEntry, RelayedRequest, Resumed,
-    Since, declare_all, far_listener, kind_matches, offers,
+    Altered, AnyInput, AnyListener, AnyLocalListener, AnyValue, Bus, Cast, CloneFn, Collected,
+    Facet, Failure, FailureKind, FailureSink, FreshFn, HookError, ListenOpts, ListenerInfo,
+    PendingRun, PendingWaker, Point, PointDecl, PointId, PointInfo, PointKey, PointKind, PointSpec,
+    Provided, Refusal, Refused, declare_all, offers,
 };
+use bus_contract_crossing::far_listener;
+use bus_contract_crossing::{
+    Answer, Authority, BusCrossing, BusJournal, Codec, Crossing, Cursor, IngestError, JOURNALED,
+    Journal, JournalEntry, Lost, Origin, Relay, Relayed, RelayedAnswer, RelayedAsk, RelayedEntry,
+    RelayedRequest, Resumed, Since, codec, is_journaled, relayable, relayable_event,
+    relayable_request,
+};
+use bus_contract_journal::kind_matches;
 
 /// Each bus a run of its own, as a process restart would give.
 static NEXT_RUN: AtomicU64 = AtomicU64::new(1);
@@ -234,19 +242,9 @@ impl Memory {
 
 impl Bus for Memory {
     fn declare_point(&self, point: PointKey, spec: PointSpec) -> Result<(), Refused> {
-        if spec.journaled && point.kind != PointKind::Event {
-            return Err(Refused::NotEvent { point: point.id });
-        }
-        if let Some(codec) = spec.relay {
-            let crosses = match point.kind {
-                PointKind::Event => true,
-                PointKind::Request => codec.answers(),
-                _ => false,
-            };
-            if !crosses {
-                return Err(Refused::NotCrossable { point: point.id });
-            }
-        }
+        bus_contract_journal::check(&point, &spec)?;
+        bus_contract_crossing::check(&point, &spec)?;
+        let spec = bus_contract_crossing::applied(&point, spec);
         let mut points = self.inner.points.lock().unwrap();
         if points.contains_key(point.id) {
             return Err(Refused::AlreadyDeclared { point: point.id });
@@ -329,8 +327,7 @@ impl Bus for Memory {
                 let mut info = PointInfo::new(k.id, k.kind);
                 info.description = s.description.clone();
                 info.declared = true;
-                info.journaled = s.journaled;
-                info.relayable = s.relay.is_some();
+                info.facets = s.facets.clone();
                 info.version = s.version;
                 info.fail_closed = s.fail_closed;
                 info.listeners = self.listeners(k.id).unwrap_or_default();
@@ -354,14 +351,26 @@ impl Bus for Memory {
         )
     }
 
-    fn journal(&self) -> Option<&dyn Journal> {
-        self.journal.then_some(self as &dyn Journal)
-    }
-
-    fn relay(&self) -> Option<&dyn Relay> {
-        (self.journal && self.relay).then_some(self as &dyn Relay)
+    fn capability(&self, contract: TypeId) -> Option<Provided<'_>> {
+        if self.journal && contract == TypeId::of::<dyn Journal>() {
+            return Some(Provided::new::<dyn Journal>(self, &AS_JOURNAL));
+        }
+        if self.journal && self.relay && contract == TypeId::of::<dyn Relay>() {
+            return Some(Provided::new::<dyn Relay>(self, &AS_RELAY));
+        }
+        None
     }
 }
+
+fn as_journal(bus: &dyn Any) -> Option<&(dyn Journal + 'static)> {
+    bus.downcast_ref::<Memory>().map(|b| b as _)
+}
+static AS_JOURNAL: Cast<dyn Journal> = as_journal;
+
+fn as_relay(bus: &dyn Any) -> Option<&(dyn Relay + 'static)> {
+    bus.downcast_ref::<Memory>().map(|b| b as _)
+}
+static AS_RELAY: Cast<dyn Relay> = as_relay;
 
 impl Journal for Memory {
     fn last_seq(&self) -> u64 {
@@ -407,13 +416,13 @@ impl Journal for Memory {
         cause: Option<u64>,
     ) -> Result<u64, Refused> {
         let Some((key, spec)) = self.inner.spec(point.id) else {
-            return Err(Refused::NotJournaled { point: point.id });
+            return Err(bus_contract_journal::not_journaled(point.id));
         };
         if key.type_id != point.type_id {
             return Err(Refused::TypeMismatch { point: point.id });
         }
-        if !spec.journaled {
-            return Err(Refused::NotJournaled { point: point.id });
+        if !is_journaled(&spec.facets) {
+            return Err(bus_contract_journal::not_journaled(point.id));
         }
         let mut entry = JournalEntry::new(0, point.id);
         entry.cause = cause;
@@ -460,7 +469,11 @@ impl Relay for Memory {
             let Some((_, spec)) = self.inner.spec(&e.kind) else {
                 continue;
             };
-            let (Some(codec), None, Some(input)) = (spec.relay, &e.origin, &e.input) else {
+            let (Some(codec), None, Some(input)) = (
+                bus_contract_crossing::codec(&spec.facets),
+                &e.origin,
+                &e.input,
+            ) else {
                 continue;
             };
             let Some(text) = (codec.encode)(&**input) else {
@@ -497,7 +510,9 @@ impl Relay for Memory {
             entry.text = Some(relayed.text);
             return Ok(self.inner.record(entry, None));
         };
-        let Some(codec) = spec.relay.filter(|_| key.kind == PointKind::Event) else {
+        let Some(codec) =
+            bus_contract_crossing::codec(&spec.facets).filter(|_| key.kind == PointKind::Event)
+        else {
             return Err(IngestError::NotRelayable { kind: relayed.kind });
         };
         if spec.version != relayed.version {
@@ -545,9 +560,8 @@ impl Memory {
         let Some((key, spec)) = self.inner.spec(&ask.kind) else {
             return Answer::refused(format!("`{}` is not declared here", ask.kind));
         };
-        let Some(codec) = spec
-            .relay
-            .filter(|c| key.kind == PointKind::Request && c.answers())
+        let Some(codec) =
+            codec(&spec.facets).filter(|c| key.kind == PointKind::Request && c.answers())
         else {
             return Answer::refused(format!("`{}` is not a relayable request here", ask.kind));
         };
@@ -607,7 +621,7 @@ struct Imported {
 /// A library's event: photos were imported. Relayable.
 struct LibraryImported;
 impl Point for LibraryImported {
-    const ID: &'static str = "library.imported";
+    const ID: PointId = PointId::new("library.imported");
     const KIND: PointKind = PointKind::Event;
     type Input = Imported;
     type Value = ();
@@ -633,7 +647,7 @@ impl Relayed for LibraryImported {
 /// A journaled event kept in its process.
 struct StepComputed;
 impl Point for StepComputed {
-    const ID: &'static str = "engine.step";
+    const ID: PointId = PointId::new("engine.step");
     const KIND: PointKind = PointKind::Event;
     type Input = u32;
     type Value = ();
@@ -642,7 +656,7 @@ impl Point for StepComputed {
 /// An event emitted directly, not journaled.
 struct VolumeMounted;
 impl Point for VolumeMounted {
-    const ID: &'static str = "volume.mounted";
+    const ID: PointId = PointId::new("volume.mounted");
     const KIND: PointKind = PointKind::Event;
     type Input = String;
     type Value = ();
@@ -651,16 +665,17 @@ impl Point for VolumeMounted {
 /// A request: not journaled.
 struct DocClose;
 impl Point for DocClose {
-    const ID: &'static str = "doc.close";
+    const ID: PointId = PointId::new("doc.close");
     const KIND: PointKind = PointKind::Request;
     type Input = String;
     type Value = Vec<String>;
 }
 
+const IMPORTED: Codec = Codec::of::<LibraryImported>();
+
 const POINTS: &[PointDecl] = &[
-    PointDecl::of::<LibraryImported>("Photos were imported.")
-        .relayable(Codec::of::<LibraryImported>()),
-    PointDecl::of::<StepComputed>("A render step was computed.").journaled(),
+    PointDecl::of::<LibraryImported>("Photos were imported.").facets(&[relayable(&IMPORTED)]),
+    PointDecl::of::<StepComputed>("A render step was computed.").facets(&[JOURNALED]),
     PointDecl::of::<VolumeMounted>("A volume was mounted."),
 ];
 
@@ -677,35 +692,33 @@ const WAIT: Duration = Duration::from_secs(5);
 
 #[test]
 fn the_table_says_what_each_point_needs() {
-    assert!(!POINTS[2].journaled && POINTS[2].relay.is_none());
-    assert!(POINTS[1].journaled && POINTS[1].relay.is_none());
-    assert!(POINTS[0].journaled && POINTS[0].relay.is_some());
-    assert_eq!(
-        POINTS[0].required(),
-        [Capability::Journal, Capability::Relay]
-    );
-    assert_eq!(POINTS[1].required(), [Capability::Journal]);
+    let says = |d: &PointDecl| (is_journaled(d.facets), codec(d.facets).is_some());
+    assert_eq!(says(&POINTS[2]), (false, false));
+    assert_eq!(says(&POINTS[1]), (true, false));
+    // A relayable event is journaled by the bus that declares it.
+    assert_eq!(says(&POINTS[0]), (false, true));
+    assert_eq!(POINTS[0].required(), [&bus_contract_crossing::CONTRACT]);
+    assert_eq!(POINTS[1].required(), [&bus_contract_journal::CONTRACT]);
     assert!(POINTS[2].required().is_empty());
     let spec = POINTS[0].spec();
-    assert!(spec.journaled);
-    assert_eq!(spec.relay, Some(Codec::of::<LibraryImported>()));
+    assert_eq!(codec(&spec.facets), Some(&IMPORTED));
 }
 
 #[test]
 fn a_bus_without_the_journal_refuses_journaled_and_relayable_points() {
     let bus: Arc<dyn Bus> = Arc::new(Memory::new(false, false, 16));
-    assert!(!offers(&*bus, Capability::Journal));
-    assert!(!offers(&*bus, Capability::Relay));
+    assert!(!offers(&*bus, &bus_contract_journal::CONTRACT));
+    assert!(!offers(&*bus, &bus_contract_crossing::CONTRACT));
     assert_eq!(
         declare_all(&*bus, POINTS),
         [
             Refused::Unsupported {
                 point: "library.imported",
-                capability: Capability::Journal
+                contract: "crossing"
             },
             Refused::Unsupported {
                 point: "engine.step",
-                capability: Capability::Journal
+                contract: "journal"
             },
         ]
     );
@@ -717,13 +730,13 @@ fn a_bus_without_the_journal_refuses_journaled_and_relayable_points() {
 #[test]
 fn a_bus_with_the_journal_only_refuses_relayable_points() {
     let bus: Arc<dyn Bus> = Arc::new(Memory::new(true, false, 16));
-    assert!(offers(&*bus, Capability::Journal));
-    assert!(!offers(&*bus, Capability::Relay));
+    assert!(offers(&*bus, &bus_contract_journal::CONTRACT));
+    assert!(!offers(&*bus, &bus_contract_crossing::CONTRACT));
     assert_eq!(
         declare_all(&*bus, POINTS),
         [Refused::Unsupported {
             point: "library.imported",
-            capability: Capability::Relay
+            contract: "crossing"
         }]
     );
 }
@@ -731,22 +744,32 @@ fn a_bus_with_the_journal_only_refuses_relayable_points() {
 #[test]
 fn only_an_event_point_is_journaled_and_a_codec_fits_its_point() {
     let bus = Memory::full();
-    let table = [
-        PointDecl::of::<DocClose>("A document closes.").journaled(),
-        PointDecl::of::<VolumeMounted>("A volume.").relayable(Codec::of::<LibraryImported>()),
+    const TABLE: &[PointDecl] = &[
+        PointDecl::of::<DocClose>("A document closes.").facets(&[JOURNALED]),
+        PointDecl::of::<VolumeMounted>("A volume.").facets(&[relayable(&IMPORTED)]),
     ];
-    assert_eq!(
-        declare_all(&*bus, &table),
-        [
-            Refused::NotEvent { point: "doc.close" },
-            Refused::TypeMismatch {
-                point: "volume.mounted"
-            },
-        ]
+    let refused = declare_all(&*bus, TABLE);
+    assert!(
+        matches!(
+            refused.as_slice(),
+            [
+                Refused::Contract {
+                    point: "doc.close",
+                    contract: "journal",
+                    ..
+                },
+                Refused::Contract {
+                    point: "volume.mounted",
+                    contract: "crossing",
+                    ..
+                },
+            ]
+        ),
+        "{refused:?}"
     );
     assert!(bus.points().is_empty());
-    let err = Refused::NotEvent { point: "doc.close" }.to_string();
-    assert!(err.contains("not an event point"), "{err}");
+    let err = refused[0].to_string();
+    assert!(err.contains("only an event point"), "{err}");
 }
 
 #[test]
@@ -756,7 +779,7 @@ fn introspection_shows_journaled_and_relayable_points() {
     let shown: Vec<_> = bus
         .points()
         .iter()
-        .map(|p| (p.id, p.journaled, p.relayable))
+        .map(|p| (p.id, is_journaled(&p.facets), codec(&p.facets).is_some()))
         .collect();
     assert_eq!(
         shown,
@@ -766,8 +789,8 @@ fn introspection_shows_journaled_and_relayable_points() {
             ("volume.mounted", false, false),
         ]
     );
-    assert_eq!(Capability::Journal.as_str(), "journal");
-    assert_eq!(Capability::Relay.as_str(), "relay");
+    assert_eq!(bus_contract_journal::CONTRACT.name, "journal");
+    assert_eq!(bus_contract_crossing::CONTRACT.name, "crossing");
 }
 
 // --- Journal ---
@@ -829,13 +852,11 @@ fn publishing_on_a_point_not_journaled_records_nothing() {
     let journal = bus.journal().unwrap();
     assert_eq!(
         journal.publish::<VolumeMounted>("/media/card".into()),
-        Err(Refused::NotJournaled {
-            point: "volume.mounted"
-        })
+        Err(bus_contract_journal::not_journaled("volume.mounted"))
     );
     assert_eq!(
         journal.publish::<DocClose>("a.txt".into()),
-        Err(Refused::NotJournaled { point: "doc.close" })
+        Err(bus_contract_journal::not_journaled("doc.close"))
     );
     assert_eq!(journal.last_seq(), 0);
 }
@@ -1107,7 +1128,7 @@ fn ingest_refuses_what_it_cannot_read_and_keeps_unknown_kinds_as_text() {
 /// is what each side did.
 struct FileDelete;
 impl Point for FileDelete {
-    const ID: &'static str = "files.delete";
+    const ID: PointId = PointId::new("files.delete");
     const KIND: PointKind = PointKind::Request;
     type Input = String;
     type Value = Vec<String>;
@@ -1142,7 +1163,7 @@ impl RelayedRequest for FileDelete {
 /// A plain alter point: it never crosses.
 struct Title;
 impl Point for Title {
-    const ID: &'static str = "doc.title";
+    const ID: PointId = PointId::new("doc.title");
     type Input = ();
     type Value = String;
 }
@@ -1158,13 +1179,16 @@ impl Relayed for Title {
 
 const ASK_DEADLINE: Duration = Duration::from_millis(300);
 
+const IMPORTED_CROSSES: &[Facet] = &[relayable_event::<LibraryImported>()];
+const DELETE_CROSSES: &[Facet] = &[relayable_request::<FileDelete>()];
+
 fn crossing_table(version: u32) -> [PointDecl; 2] {
     [
         PointDecl::of::<LibraryImported>("Photos were imported.")
-            .relayable(Codec::of::<LibraryImported>())
+            .facets(IMPORTED_CROSSES)
             .version(version),
         PointDecl::of::<FileDelete>("Files are deleted.")
-            .relayable(Codec::request::<FileDelete>())
+            .facets(DELETE_CROSSES)
             .version(version),
     ]
 }
@@ -1220,9 +1244,10 @@ fn node_deletes(node: &Arc<dyn Bus>) -> Arc<Mutex<Vec<String>>> {
 fn a_relayable_request_is_fail_closed_and_only_events_and_requests_cross() {
     let [_, delete] = crossing_table(3);
     assert_eq!(delete.kind, PointKind::Request);
-    assert!(delete.fail_closed && !delete.journaled);
+    // Fail-closed once a bus applies it (`bus_contract_crossing::applied`).
+    assert!(!is_journaled(delete.facets) && codec(delete.facets).is_some());
     assert_eq!(delete.version, 3);
-    assert_eq!(delete.required(), [Capability::Relay]);
+    assert_eq!(delete.required(), [&bus_contract_crossing::CONTRACT]);
     assert!(Codec::request::<FileDelete>().answers());
     assert!(!Codec::of::<LibraryImported>().answers());
 
@@ -1233,24 +1258,28 @@ fn a_relayable_request_is_fail_closed_and_only_events_and_requests_cross() {
         .into_iter()
         .find(|p| p.id == "files.delete")
         .unwrap();
-    assert!(info.relayable && info.fail_closed && !info.journaled);
+    assert!(codec(&info.facets).is_some() && info.fail_closed && !is_journaled(&info.facets));
     assert_eq!(info.version, 3);
 
     let bus = Memory::full();
-    let table = [
-        PointDecl::of::<Title>("A title.").relayable(Codec::of::<Title>()),
-        PointDecl::of::<FileDelete>("No value codec.").relayable(Codec::of::<FileDelete>()),
+    const TABLE: &[PointDecl] = &[
+        PointDecl::of::<Title>("A title.").facets(&[relayable_event::<Title>()]),
+        PointDecl::of::<FileDelete>("No value codec.").facets(&[relayable_event::<FileDelete>()]),
     ];
-    assert_eq!(
-        declare_all(&*bus, &table),
-        [
-            Refused::NotCrossable { point: "doc.title" },
-            Refused::NotCrossable {
-                point: "files.delete"
-            },
-        ]
-    );
-    let err = Refused::NotCrossable { point: "doc.title" }.to_string();
+    let refused = declare_all(&*bus, TABLE);
+    let points: Vec<_> = refused
+        .iter()
+        .map(|r| match r {
+            Refused::Contract {
+                point,
+                contract: "crossing",
+                ..
+            } => *point,
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(points, ["doc.title", "files.delete"]);
+    let err = refused[0].to_string();
     assert!(err.contains("cannot cross"), "{err}");
 }
 

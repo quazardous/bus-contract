@@ -30,19 +30,20 @@ versioned on its own ([RELEASING.md](https://github.com/quazardous/bus-contract/
 | [`bus-contract-journal`](https://crates.io/crates/bus-contract-journal) | `Journal`: numbered events, read again, delivered off the publisher |
 | [`bus-contract-crossing`](https://crates.io/crates/bus-contract-crossing) | `Relay`: what crosses a process boundary, on top of the journal |
 
-Today the four capability crates re-export the core's own items and add
-an extension trait each (`BusDefer`, `BusTimings`, `BusJournal`,
-`BusCrossing`) that gives `bus.defer()`, `bus.timings()`,
-`bus.journal()` and `bus.relay()` on any bus. In `bus-contract` 0.5 the
-capability traits move into these crates and the core keeps only the
-lookup: code that imports the capability items from the crates now has
-only a `use` line to add then.
+Since `bus-contract` 0.5 each capability crate owns its trait and types,
+its `CONTRACT` and its facets, and adds an extension trait
+(`BusDefer`, `BusTimings`, `BusJournal`, `BusCrossing`) that gives
+`bus.defer()`, `bus.timings()`, `bus.journal()` and `bus.relay()` on any
+bus through the core's typed lookup. The core names none of them, so a
+capability contract can change without a core release.
+
+Upgrading from 0.4: [MIGRATION-0.5.md](https://github.com/quazardous/bus-contract/blob/main/MIGRATION-0.5.md).
 
 ## Contents
 
-- **Points are types** (`Point`): an id (`doc.close`), the input every
-  listener reads, the value a listener edits, and a declared kind
-  (`request`, `event`, `alter`, `collect`).
+- **Points are types** (`Point`): an id (`PointId`, `doc.close`, checked
+  when made), the input every listener reads, the value a listener
+  edits, and a declared kind (`request`, `event`, `alter`, `collect`).
 - **`Bus`**, an object-safe trait (`Arc<dyn Bus>`): declare a point;
   listen under an id and an owner, ordered by `after` / `before` /
   `last`, then priority; unlisten; forget an owner; `alter` and
@@ -55,17 +56,15 @@ only a `use` line to add then.
 - **Refusals on requests**: a listener returns `HookError::refuse(reason)`
   and the request stops there; a point declared `fail_closed` turns a
   listener failure into a refusal.
-- **Optional capabilities**, found at run time: `Bus::defer()` returns
-  the `Defer` capability (requests asked now, heard at the next drain on
-  the same thread) or `None`; `Bus::timings()` returns the `Timings`
-  capability (per-point and per-listener times, passes over a point's
-  budget reported) or `None`; `Bus::journal()` returns the `Journal`
-  capability (events with a number, read again from one, delivered
-  after the publisher has moved on); `Bus::relay()` returns the `Relay`
-  capability (what crosses a process boundary: events of relayable
-  points served to another process and taken in from one, asks of
-  relayable requests answered for one, each with its origin, behind
-  the receiver's authorities).
+- **Optional capabilities**, found at run time through the typed lookup
+  `Bus::capability`, each defined in its own crate: `Defer` (requests
+  asked now, heard at the next drain on the same thread), `Timings`
+  (per-point and per-listener times, passes over a point's budget
+  reported), `Journal` (events with a number, read again from one,
+  delivered after the publisher has moved on) and `Relay` (what crosses
+  a process boundary: events of relayable points served to another
+  process and taken in from one, asks of relayable requests answered
+  for one, each with its origin, behind the receiver's authorities).
 - **Typed calls on `dyn Bus`** (`declare::<P>`, `listen::<P>`,
   `listen_local::<P>`, `alter::<P>`, `collect::<P>`, `on_failure`,
   `on_pending`), written once over the erased methods: an
@@ -109,12 +108,12 @@ the `bus-kernel` conformance check that proves it. In short:
 
 ```rust
 use std::sync::Arc;
-use bus_contract::{Bus, ListenOpts, Point, PointDecl, PointKind, declare_all};
+use bus_contract::{Bus, ListenOpts, Point, PointDecl, PointId, PointKind, declare_all};
 
 /// The library's request: a document closes.
 pub struct DocClose;
 impl Point for DocClose {
-    const ID: &'static str = "doc.close";
+    const ID: PointId = PointId::new("doc.close");
     const KIND: PointKind = PointKind::Request;
     type Input = String;
     type Value = Vec<String>;
@@ -173,6 +172,26 @@ application puts on its bus. A clash is refused at declaration time
 (`Refused::TypeMismatch`): a point id is registered with one `Point`
 type.
 
+The rule is checked (`check_id`): at least two dot-separated segments,
+none empty; the prefix is `[a-z][a-z0-9_-]*`, the other segments
+`[A-Za-z0-9_-]+`.
+
+- A point's id is a `PointId`. `PointId::new` is a `const fn` that
+  panics on a bad id, so `const ID: PointId = PointId::new("close");`
+  does not compile. It reads as a `&str` (`Deref`, `as_str`, comparisons
+  with `str`).
+- A listener's id may be a `ListenerId` (`ListenerId::new` in a `const`,
+  `ListenerId::try_new` at run time), or any string: the bus checks it
+  when the listener registers and refuses a bad one
+  (`Refused::BadId`). An implementation also refuses a point key whose
+  id breaks the rule.
+
+Newtype ids checked at construction come from
+[eventbus-contract](https://github.com/mapseekai/eventbus-contract)
+(`Topic::new`, `ConsumerGroup::new`); the `const` form that fails at
+compile time from [qubit-event-bus](https://github.com/qubit-ltd/rs-event-bus)
+(`Topic::new_static`).
+
 ## Local listeners
 
 A listener registered with `listen_local::<P>` may hold state that is
@@ -222,7 +241,7 @@ handler run when the policy itself breaks.
 pub const POINTS: &[PointDecl] =
     &[PointDecl::of::<CommandRun>("A command runs.").fail_closed()];
 
-bus.listen::<CommandRun>("policy", ListenOpts::new().priority(1000), |run, _| {
+bus.listen::<CommandRun>("app.policy", ListenOpts::new().priority(1000), |run, _| {
     if run.origin.is_agent() && run.id == "files.delete" {
         return Err(HookError::refuse("agents may not delete files"));
     }
@@ -230,31 +249,43 @@ bus.listen::<CommandRun>("policy", ListenOpts::new().priority(1000), |run, _| {
 })?;
 let out = bus.alter::<CommandRun>(run, Outcome::default());
 if let Some(refusal) = out.refused {
-    // "hook `command.run`: refused by `policy`: agents may not delete files"
+    // "hook `command.run`: refused by `app.policy`: agents may not delete files"
 }
 ```
 
 ## Capabilities
 
 The `Bus` trait is the core every implementation offers. An
-implementation may offer more, each part as a trait of its own, found
-at run time through a provided method of `Bus` that returns `None` by
-default. One `dyn Bus` type works everywhere, whatever the
-implementation offers.
+implementation may offer more, each a contract of its own, defined in a
+crate of its own and found at run time through the typed lookup
+`Bus::capability`, which returns `None` by default. One `dyn Bus` type
+works everywhere, whatever the implementation offers.
 
-- A library that needs a capability names it in its contract table
-  (`PointDecl::needs`). `declare_all` refuses such a point on a bus
-  without it (`Refused::Unsupported`) and leaves it undeclared.
-- A library that can do without one calls the method and falls back
-  when it gets `None`.
-- `offers(bus, Capability::Defer)` tells whether a bus has one.
+| Contract | Crate | Trait | Extension trait | `CONTRACT` | Facets |
+|---|---|---|---|---|---|
+| defer | `bus-contract-defer` | `Defer` | `BusDefer` (`bus.defer()`) | `bus_contract_defer::CONTRACT` | |
+| timings | `bus-contract-timings` | `Timings` | `BusTimings` (`bus.timings()`) | `bus_contract_timings::CONTRACT` | |
+| journal | `bus-contract-journal` | `Journal` | `BusJournal` (`bus.journal()`) | `bus_contract_journal::CONTRACT` | `JOURNALED` |
+| crossing | `bus-contract-crossing` | `Relay` | `BusCrossing` (`bus.relay()`) | `bus_contract_crossing::CONTRACT` (requires journal) | `relayable(&CODEC)`, `relayable_event::<P>()`, `relayable_request::<P>()` |
 
-Each capability is also found by a typed lookup:
-`Bus::capability(TypeId)` returns the bus as `Any` with a cast to the
-capability's trait (`Provided`), and `capability::<dyn Journal, _>(&bus)`
-or `bus.get::<dyn Journal>()` on a `dyn Bus` gives `Option<&dyn
-Journal>`. The four getters default to this lookup, so an implementation
-writes one method, `capability`, with one small cast per capability:
+- A library that needs a capability names its contract in its table
+  (`PointDecl::needs(&[&bus_contract_defer::CONTRACT])`), or gives the
+  point a facet of it (`PointDecl::facets(&[JOURNALED])`): what the
+  declaration says for that contract, data only that contract's crate
+  reads. `declare_all` refuses such a point on a bus without the
+  contract (`Refused::Unsupported`) and leaves it undeclared.
+- A library that can do without one calls the extension trait
+  (`use bus_contract_defer::BusDefer;` then `bus.defer()`) and falls
+  back when it gets `None`.
+- `offers(bus, &bus_contract_defer::CONTRACT)` tells whether a bus has
+  one, and the contracts it requires.
+
+The lookup is keyed by the trait's `TypeId`: `Bus::capability(TypeId)`
+returns the bus as `Any` with a cast to the capability's trait
+(`Provided`), and `capability::<dyn Journal, _>(&bus)` or
+`bus.get::<dyn Journal>()` on a `dyn Bus` gives `Option<&dyn Journal>`.
+An implementation writes one method, `capability`, with one small cast
+per capability:
 
 ```rust,ignore
 fn as_journal(bus: &dyn Any) -> Option<&(dyn Journal + 'static)> {
@@ -271,20 +302,15 @@ impl Bus for MyBus {
 }
 ```
 
-The lookup is keyed by the trait's `TypeId`, so the core can reach a
-capability whose trait it does not name: it is how capability contracts
-will move to crates of their own. An implementation that overrides the
-getters (written before 0.4.4) keeps working; its lookup answers `None`
-until it implements `capability`.
-
-Each capability is also published as a crate of its own
-(`bus-contract-defer`, `-timings`, `-journal`, `-crossing`; see
-[Crates](#crates)). Import the capability's items from there to be
-ready for 0.5, which moves them out of the core.
+Two semver-incompatible versions of a contract crate have different
+trait types: a library on one, over a bus implementing the other, is
+refused by `declare_all` with the contract's name instead of failing to
+build.
 
 ### Defer
 
-`Bus::defer()` returns `Option<&dyn Defer>`. A request asked through it
+`bus.defer()` (`use bus_contract_defer::BusDefer;`) returns
+`Option<&dyn Defer>`. A request asked through it
 returns at once; its listeners run at the next `drain()` on the same
 thread. It is for code that cannot be re-entered while it runs, such as
 an interface drawing a panel with its state borrowed.
@@ -301,7 +327,7 @@ an interface drawing a panel with its state borrowed.
 
 ```rust,ignore
 pub const POINTS: &[PointDecl] = &[PointDecl::of::<LibraryWrite>("A library write.")
-    .needs(&[Capability::Defer])];
+    .needs(&[&bus_contract_defer::CONTRACT])];
 
 // while drawing, with the library borrowed:
 bus.defer().expect("declared with needs").ask::<LibraryWrite>(write, Vec::new());
@@ -313,7 +339,8 @@ for run in bus.defer().map(|d| d.drain()).unwrap_or_default() {
 
 ### Timings
 
-`Bus::timings()` returns `Option<&dyn Timings>`: how long listeners
+`bus.timings()` (`use bus_contract_timings::BusTimings;`) returns
+`Option<&dyn Timings>`: how long listeners
 take, per point and per listener (`TimingStats`: count, total, max,
 p50, p95), since the last `reset()`.
 
@@ -344,8 +371,9 @@ if let Some(timings) = bus.timings() {
 
 ### Journal
 
-`Bus::journal()` returns `Option<&dyn Journal>`. An event point
-declared `journaled()` is published through the journal instead of
+`bus.journal()` (`use bus_contract_journal::BusJournal;`) returns
+`Option<&dyn Journal>`. An event point declared with the `JOURNALED`
+facet is published through the journal instead of
 emitted: the publisher gets a number and moves on, and the listeners
 hear each event once, in number order, on a thread of the
 implementation's (a pump). A slow listener delays the next events, not
@@ -362,8 +390,10 @@ the publisher.
 
 ### Relay
 
-`Bus::relay()` returns `Option<&dyn Relay>`, on a bus that offers the
-journal. An event point declared `relayable(Codec::of::<P>())` has its
+`bus.relay()` (`use bus_contract_crossing::BusCrossing;`) returns
+`Option<&dyn Relay>`, on a bus that offers the journal. An event point
+declared with the `relayable_event::<P>()` facet (codec
+`Codec::of::<P>()`) has its
 input written as text and read back by another process (`Relayed`: the
 format is the application's). The transport is not part of the
 contract (see [Crossing](#crossing)).
@@ -382,8 +412,8 @@ contract (see [Crossing](#crossing)).
 ```rust,ignore
 pub const POINTS: &[PointDecl] = &[
     PointDecl::of::<LibraryImported>("Photos were imported.")
-        .relayable(Codec::of::<LibraryImported>()),
-    PointDecl::of::<StepComputed>("A render step was computed.").journaled(),
+        .facets(&[relayable_event::<LibraryImported>()]),
+    PointDecl::of::<StepComputed>("A render step was computed.").facets(&[JOURNALED]),
 ];
 
 // the node publishes and moves on:
@@ -407,14 +437,17 @@ listener cannot tell whether the far side is in its process or not:
 that is the meaning a conformance suite checks.
 
 **What may cross.** A point crosses only when its table line says so,
-with `relayable(codec)`:
+with the crossing facet carrying its codec (`relayable(&CODEC)`):
 
-- an event point (`Codec::of::<P>()`, `Relayed`): its events, as above;
-- a request point (`Codec::request::<P>()`, `RelayedRequest`: the value
-  is written and read too): asks from another process. A relayable
-  request is fail-closed.
+- an event point (`relayable_event::<P>()`, codec `Codec::of::<P>()`,
+  `Relayed`): its events, as above; the bus journals them;
+- a request point (`relayable_request::<P>()`, codec
+  `Codec::request::<P>()`, `RelayedRequest`: the value is written and
+  read too): asks from another process. A relayable request is
+  fail-closed.
 
-Alter and collect points never cross (`Refused::NotCrossable`). Each
+Alter and collect points never cross (`Refused::Contract` from the
+crossing contract). Each
 point has a version (`PointDecl::version`, from 1), raised when its
 payload changes in a way an older reader cannot use; a field a reader
 may ignore is not such a change. Two processes cross a point only at
@@ -463,7 +496,7 @@ answer); a panic refuses.
 
 ```rust,ignore
 pub const POINTS: &[PointDecl] = &[PointDecl::of::<FileDelete>("Files are deleted.")
-    .relayable(Codec::request::<FileDelete>())];
+    .facets(&[relayable_request::<FileDelete>()])];
 
 // the node: agents may not delete.
 node.relay().unwrap().authorize(|c| match &c.origin.agent {
