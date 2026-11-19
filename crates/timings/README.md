@@ -24,29 +24,19 @@ fn has_timings(bus: &Arc<dyn bus_contract::Bus>) -> bool {
 - `BusTimings` gives `bus.timings()` on any bus: `dyn Bus`, `Arc<dyn Bus>` or a
   concrete one. It returns `None` when the bus does not offer the
   capability.
-- The contract's items are re-exported here: `Timings`, `PointTimings`, `ListenerTimings`, `TimingStats`, `OverBudget`, `BudgetSink`, `OVER_BUDGET_FACT`.
+- The contract's items live here: `Timings`, `TimingStats`, `PointTimings`, `ListenerTimings`, `OverBudget`, `BudgetSink`, `OVER_BUDGET_FACT`, and the `CONTRACT`.
 
-## Status: a facade over bus-contract 0.4
+## Status: owns its contract since 0.2
 
-In this release (0.1) the items above are the `bus-contract` 0.4
-core's own items, re-exported: nothing changes for a bus or a library,
-and code importing from here works with code importing from the core.
-The point of this release is to let users switch their imports before
-the break:
+Since 0.2, with `bus-contract` 0.5, the items above are defined here,
+not in the core. The core names no capability: it keeps the typed
+lookup (`Bus::capability`), the `Contract` and `Facet` types, and
+`offers`. `BusTimings` reaches the capability through that lookup only.
 
-- **Now**: import the timings items from `bus_contract_timings` instead of
-  `bus_contract`.
-- **`bus-contract` 0.5**: the items move here, and the core loses its
-  `timings()` getter. Code calling `bus.timings()` adds
-  `use bus_contract_timings::BusTimings;`, and nothing else changes. This crate then
-  moves to 0.2.
-
-One catch while the core still has its getter: on an `Arc<dyn Bus>`,
-in a file that imports both `bus_contract::Bus` and `BusTimings`,
-`bus.timings()` names two methods and does not compile (E0034). Either
-leave `BusTimings` out of that file until 0.5, or write
-`BusTimings::timings(&bus)`. On a `&dyn Bus` or a generic `B: Bus` the call
-compiles either way and both give the same answer.
+Upgrading from 0.1 and `bus-contract` 0.4: import the items from
+`bus_contract_timings` and add `use bus_contract_timings::BusTimings;` where
+`bus.timings()` is called. Every rename is in
+[MIGRATION-0.5.md](https://github.com/quazardous/bus-contract/blob/main/MIGRATION-0.5.md).
 
 ## Guarantees
 
@@ -59,7 +49,7 @@ that proves it.
 ## Versions
 
 Released on its own, with its own [CHANGELOG](CHANGELOG.md). Needs
-`bus-contract` 0.4.4 or later (the typed capability lookup). See
+`bus-contract` 0.5. See
 [RELEASING.md](https://github.com/quazardous/bus-contract/blob/main/RELEASING.md)
 for the repository's crates and their publish order.
 

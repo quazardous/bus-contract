@@ -1,5 +1,79 @@
 # Changelog
 
+## 0.5.0
+
+The one breaking release before 1.0: the core stops naming the
+capabilities, and point and listener ids are checked. Every change, with
+before and after code, is in
+[MIGRATION-0.5.md](https://github.com/quazardous/bus-contract/blob/main/MIGRATION-0.5.md).
+Writing one migration guide per breaking release follows
+eventbus-contract's `MIGRATION-0.2.md`
+(<https://github.com/mapseekai/eventbus-contract>).
+
+Capabilities move to their crates (each now 0.2.0):
+
+- `Defer` moves to `bus-contract-defer`; `Timings`, `TimingStats`,
+  `PointTimings`, `ListenerTimings`, `OverBudget`, `BudgetSink` and
+  `OVER_BUDGET_FACT` to `bus-contract-timings`; `Journal`,
+  `JournalEntry`, `Since`, `Origin` and `kind_matches` to
+  `bus-contract-journal`; `Relay`, `Codec`, `Relayed`, `RelayedRequest`,
+  `Answer`, `Authority`, `Crossing`, `Cursor`, `IngestError`, `Lost`,
+  `Resumed`, `RelayedEntry`, `RelayedAsk`, `RelayedAnswer`,
+  `EncodeFn`, `DecodeFn`, `EncodeValueFn`, `DecodeValueFn`,
+  `far_listener` and `ask_run` to `bus-contract-crossing`.
+- The getters `Bus::defer`, `Bus::timings`, `Bus::journal` and
+  `Bus::relay` are removed (on `Bus` and on `Arc<B>`). A bus implements
+  `Bus::capability` only; callers use the contract crates' extension
+  traits (`use bus_contract_journal::BusJournal;` then
+  `bus.journal()`), which go through the lookup. The E0034 name clash
+  of 0.4.5 is gone with the getters.
+- `Capability` is removed. A capability contract is a `Contract` value
+  (name, version line, the contracts it requires, its trait's
+  `TypeId`), exported by its crate as `CONTRACT`. `PointDecl::needs`
+  takes `&'static [&'static Contract]`; `offers(bus, &CONTRACT)` checks
+  the contract and those it requires.
+- What a declaration says for one contract is a `Facet` (the contract
+  and `'static` data only its crate reads), `const`-friendly:
+  `PointDecl::facets(&[…])`, `PointSpec::facets` / `PointSpec::facet`,
+  `PointInfo::facets`. `PointDecl::journaled()` / `PointSpec::journaled`
+  become the `bus_contract_journal::JOURNALED` facet;
+  `PointDecl::relayable(codec)`, `PointSpec::relayable` /
+  `relayable_request` and `PointSpec::relay` become the crossing facet
+  (`relayable(&CODEC)`, `relayable_event::<P>()`,
+  `relayable_request::<P>()`). `PointInfo::journaled` and
+  `PointInfo::relayable` are read with `is_journaled(&facets)` and
+  `codec(&facets)`. `PointDecl::required()` returns the contracts.
+- `Refused::Unsupported` names the missing contract
+  (`contract: &'static str`); `Refused::NotEvent`, `NotJournaled` and
+  `NotCrossable` become `Refused::Contract { point, contract, reason }`,
+  made by the contract crates (`check`, `not_journaled`).
+- `clone_value` and `fresh_value` are public, for the contract crates
+  and implementations.
+
+Validated ids:
+
+- `Point::ID` is a `PointId`, made with the `const fn PointId::new`,
+  which panics on an id that breaks the naming rule, so a bad id in a
+  `const` does not compile. It reads as a `&str` (`Deref`, `as_str`,
+  `Display`, comparisons with `str`).
+- `ListenerId` (`const fn new`, `try_new`), optional: the typed
+  `listen` calls still take any `impl Into<String>`. A bus refuses a
+  listener id or a point key id that breaks the rule with the new
+  `Refused::BadId { id, error }`.
+- `check_id` and `IdError` give the rule (`<crate>.<subject>.<moment>`:
+  at least two dot-separated segments, none empty, the prefix
+  `[a-z][a-z0-9_-]*`, the others `[A-Za-z0-9_-]+`).
+- Credits: newtype ids checked at construction come from
+  eventbus-contract's `Topic::new` and `ConsumerGroup::new`
+  (<https://github.com/mapseekai/eventbus-contract>); the `const`
+  constructor that fails at compile time from qubit-event-bus's
+  `Topic::new_static` (<https://github.com/qubit-ltd/rs-event-bus>).
+
+GUARANTEES.md: `core.capability.lookup-agrees` now reads the extension
+traits instead of the getters; new rows `core.id.point-checked`,
+`core.id.listener-checked` and `core.id.const-checked`; the rows naming
+the removed refusals name `Refused::Contract`.
+
 ## 0.4.5
 
 Docs and packaging only: no change to the traits or their behaviour.

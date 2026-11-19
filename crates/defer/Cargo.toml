@@ -1,7 +1,7 @@
 [package]
 name = "bus-contract-defer"
-version = "0.1.0"
-description = "The defer contract of bus-contract: requests asked now, whose listeners run at the next drain on the same thread. Today a facade over the bus-contract core, so code can switch its imports before the core 0.5 moves the capability here."
+version = "0.2.0"
+description = "The defer contract of bus-contract: requests asked now, whose listeners run at the next drain on the same thread. It owns its trait and types; a bus offers it through the core's typed capability lookup."
 readme = "README.md"
 include = ["src/", "README.md", "CHANGELOG.md", "LICENSE-*"]
 keywords = ["event-bus", "contract", "hooks", "deferred"]
@@ -15,7 +15,7 @@ homepage.workspace = true
 authors.workspace = true
 
 [dependencies]
-bus-contract = { version = "0.4.4", path = "../.." }
+bus-contract = { version = "0.5.0", path = "../.." }
 
 [dev-dependencies]
 bus-contract-testkit = { path = "../testkit" }

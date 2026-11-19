@@ -10,16 +10,19 @@ parts instead, as optional capabilities shaped like `Defer`.
 
 ## Decisions
 
-**Optional, found at run time.** `Bus::journal()` and `Bus::relay()`
-return `None` by default. An implementation of 0.3 keeps compiling and
-offers neither. A point that needs one says so in its declaration
-(`journaled()`, `relayable(codec)`) and `declare_all` refuses it on a
-bus that cannot serve it (`Refused::Unsupported`), as `needs` does for
-`Defer`. `PointDecl::required()` lists the capabilities a point needs,
-named and implied.
+**Optional, found at run time.** The journal and the relay are
+capability contracts of their own (`bus-contract-journal`,
+`bus-contract-crossing`), reached through the core's typed lookup
+(`bus.journal()`, `bus.relay()` with the crates' extension traits),
+`None` when the bus does not offer them. A point that needs one says so
+in its declaration with a facet (`JOURNALED`, `relayable(&CODEC)`) and
+`declare_all` refuses it on a bus that cannot serve it
+(`Refused::Unsupported`), as `needs` does for `Defer`.
+`PointDecl::required()` lists the contracts a point needs, named and
+from its facets.
 
 **Journaled is a property of an event point.** Only `PointKind::Event`
-points are journaled (`Refused::NotEvent` otherwise): requests and
+points are journaled (the journal contract refuses the others, `Refused::Contract`): requests and
 alters return values to their caller, which a deferred delivery cannot.
 A journaled point's events are published through the journal, not
 emitted; the same point type is used to listen, so a listener does not

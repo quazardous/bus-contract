@@ -21,11 +21,6 @@ pub const LAST: &str = "*";
 /// sinks receive ([`Bus::add_failure_sink`](crate::Bus::add_failure_sink)).
 pub const FAILED_FACT: &str = "hook.failed";
 
-/// The name a host gives the fact it publishes for each [`OverBudget`]
-/// its budget sinks receive
-/// ([`Timings::add_budget_sink`](crate::Timings::add_budget_sink)).
-pub const OVER_BUDGET_FACT: &str = "bus.overBudget";
-
 /// A hook point: one type per point, so its input and value are checked
 /// at compile time. Declared by the crate that owns the result.
 ///
@@ -35,8 +30,10 @@ pub const OVER_BUDGET_FACT: &str = "bus.overBudget";
 /// in order; a [`collect`](crate::Bus::collect_any) emit gives each listener a
 /// fresh value and gathers them in a list.
 pub trait Point: 'static {
-    /// The point's id, dotted by convention (`health.report`).
-    const ID: &'static str;
+    /// The point's id, `<crate>.<subject>.<moment>`, checked when made:
+    /// `const ID: PointId = PointId::new("health.report");` does not
+    /// compile with a bad id ([`PointId`](crate::PointId)).
+    const ID: crate::PointId;
     /// What every listener reads: shared, never changed by a listener.
     type Input: Send + Sync + 'static;
     /// What a listener edits: the value altered in turn, or one
@@ -97,24 +94,18 @@ pub struct PointSpec {
     /// ([`Refusal::failed`]). Ignored on the other kinds.
     pub fail_closed: bool,
     /// The time one pass of the point's listeners should take on a
-    /// thread ([`Timings`](crate::Timings)): a pass over it is reported
-    /// ([`OverBudget`]), never failed. `None`: no budget.
+    /// thread (the timings contract): a pass over it is reported
+    /// (the timings contract's `OverBudget`), never failed. `None`: no budget.
     pub budget: Option<Duration>,
-    /// On a [`PointKind::Event`] point, its events go through the bus's
-    /// journal ([`Journal`](crate::Journal)): published with a number,
-    /// delivered to the listeners in journal order after the publisher
-    /// has moved on.
-    pub journaled: bool,
-    /// How the point crosses a process ([`Relay`](crate::Relay)): on a
-    /// journaled event point, how its input is written; on a request
-    /// point, its input and value ([`Codec::request`](crate::Codec::request)),
-    /// so another process may ask it ([`Relay::answer`](crate::Relay::answer)).
-    /// `None`: it stays in this one.
-    pub relay: Option<crate::Codec>,
+    /// What the declaration says for capability contracts
+    /// ([`Facet`](crate::Facet)): a journaled mark, a codec. Each facet's
+    /// contract is needed ([`declare_all`](crate::declare_all)), and the
+    /// implementation of that contract reads it; the core does not.
+    pub facets: Vec<crate::Facet>,
     /// The point's version, from 1: raised when its payload changes in a
     /// way an older reader cannot use (a field it may ignore is not such
     /// a change). Two processes cross a point only at the same version
-    /// ([`IngestError::Version`](crate::IngestError::Version)).
+    /// (the crossing contract).
     pub version: u32,
 }
 
@@ -126,8 +117,7 @@ impl PointSpec {
             deadline: None,
             fail_closed: false,
             budget: None,
-            journaled: false,
-            relay: None,
+            facets: Vec::new(),
             version: 1,
         }
     }
@@ -151,28 +141,15 @@ impl PointSpec {
         self
     }
 
-    /// Its events go through the journal ([`PointSpec::journaled`]).
-    pub fn journaled(mut self) -> PointSpec {
-        self.journaled = true;
+    /// Adds a facet of a capability contract ([`PointSpec::facets`]).
+    pub fn facet(mut self, facet: crate::Facet) -> PointSpec {
+        self.facets.push(facet);
         self
     }
 
-    /// Its events cross processes with `codec`; journaled too
-    /// ([`PointSpec::relay`]). For an event point: a request uses
-    /// [`PointSpec::relayable_request`].
-    pub fn relayable(mut self, codec: crate::Codec) -> PointSpec {
-        self.journaled = true;
-        self.relay = Some(codec);
-        self
-    }
-
-    /// Another process may ask this request, its input and value written
-    /// by `codec` ([`Codec::request`](crate::Codec::request)); fail-closed
-    /// too, so no answer in time is a refusal ([`PointSpec::relay`]).
-    pub fn relayable_request(mut self, codec: crate::Codec) -> PointSpec {
-        self.fail_closed = true;
-        self.relay = Some(codec);
-        self
+    /// Whether the declaration has a facet of `contract`.
+    pub fn has(&self, contract: &crate::Contract) -> bool {
+        self.facets.iter().any(|f| f.contract == contract)
     }
 
     /// The point's version ([`PointSpec::version`]).
@@ -468,34 +445,36 @@ pub enum Refused {
         /// The listener.
         listener: String,
     },
-    /// The point needs a capability the bus does not offer
-    /// ([`PointDecl::needs`](crate::PointDecl::needs)); it was not
+    /// The point needs a capability contract the bus does not offer
+    /// ([`PointDecl::needs`](crate::PointDecl::needs),
+    /// [`PointDecl::facets`](crate::PointDecl::facets)); it was not
     /// declared.
     Unsupported {
         /// The point.
         point: &'static str,
-        /// The capability missing.
-        capability: Capability,
+        /// The contract missing ([`Contract::name`](crate::Contract::name)).
+        contract: &'static str,
     },
-    /// Only an event point is journaled or relayed
-    /// ([`PointSpec::journaled`]); it was not declared.
-    NotEvent {
+    /// A capability contract refused what the point's declaration or a
+    /// call says for it: a journaled mark on a point that is not an
+    /// event, a codec of another point, a publish on a point not
+    /// journaled. Nothing was declared or recorded.
+    Contract {
         /// The point.
         point: &'static str,
+        /// The contract that refused it.
+        contract: &'static str,
+        /// Why.
+        reason: String,
     },
-    /// An event was published through the journal on a point not
-    /// declared journaled on this bus; nothing was recorded.
-    NotJournaled {
-        /// The point.
-        point: &'static str,
-    },
-    /// The point is relayable but cannot cross: only an event point, or
-    /// a request point whose codec writes its value too
-    /// ([`Codec::request`](crate::Codec::request)), crosses a process. It
-    /// was not declared.
-    NotCrossable {
-        /// The point.
-        point: &'static str,
+    /// An id breaks the naming rule ([`check_id`](crate::check_id)): a
+    /// point key's id at declaration, a listener's id when it
+    /// registers. Nothing was changed.
+    BadId {
+        /// The id refused.
+        id: String,
+        /// Why.
+        error: crate::IdError,
     },
 }
 
@@ -520,61 +499,24 @@ impl fmt::Display for Refused {
                 f,
                 "hook `{point}`: the local listener `{listener}` runs on its own thread, not a new one"
             ),
-            Refused::Unsupported { point, capability } => write!(
+            Refused::Unsupported { point, contract } => write!(
                 f,
-                "hook `{point}` needs the `{}` capability, which this bus does not offer",
-                capability.as_str()
+                "hook `{point}` needs the `{contract}` contract, which this bus does not offer"
             ),
-            Refused::NotEvent { point } => write!(
+            Refused::Contract {
+                point,
+                contract,
+                reason,
+            } => write!(
                 f,
-                "hook `{point}` is journaled or relayable but is not an event point"
+                "hook `{point}`: refused by the `{contract}` contract: {reason}"
             ),
-            Refused::NotJournaled { point } => {
-                write!(f, "hook `{point}` is not declared journaled on this bus")
-            }
-            Refused::NotCrossable { point } => write!(
-                f,
-                "hook `{point}` is relayable but cannot cross: only an event, or a request with a value codec, crosses"
-            ),
+            Refused::BadId { id, error } => write!(f, "id `{id}` refused: {error}"),
         }
     }
 }
 
 impl std::error::Error for Refused {}
-
-/// A capability a bus may offer beyond the core of [`Bus`](crate::Bus),
-/// found at run time ([`Bus::defer`](crate::Bus::defer)). A library names
-/// the ones its points need in its contract table
-/// ([`PointDecl::needs`](crate::PointDecl::needs)).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum Capability {
-    /// Requests asked now and heard at the bus's next drain on the same
-    /// thread ([`Defer`](crate::Defer)).
-    Defer,
-    /// How long listeners take, per point and listener, and passes over
-    /// a point's budget reported ([`Timings`](crate::Timings)).
-    Timings,
-    /// Events kept with a number, read again from one, delivered after
-    /// the publisher has moved on ([`Journal`](crate::Journal)).
-    Journal,
-    /// Events of relayable points served to another process and taken
-    /// in from one, asks of relayable requests answered for one
-    /// ([`Relay`](crate::Relay)); implies `Journal`.
-    Relay,
-}
-
-impl Capability {
-    /// The capability as messages write it (`defer`).
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Capability::Defer => "defer",
-            Capability::Timings => "timings",
-            Capability::Journal => "journal",
-            Capability::Relay => "relay",
-        }
-    }
-}
 
 /// A request stopped by one of its listeners: the listener refused it
 /// ([`HookError::Refuse`]), or failed on a fail-closed point
@@ -713,7 +655,7 @@ impl<V> Default for Collected<V> {
 
 /// What listeners run later did: one emit's local listeners queued for
 /// their thread ([`Bus::run_pending`](crate::Bus::run_pending)), or one
-/// deferred request ([`Defer::drain`](crate::Defer::drain)).
+/// deferred request (the defer contract's drain).
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct PendingRun {
@@ -726,7 +668,7 @@ pub struct PendingRun {
     pub failures: Vec<Failure>,
     /// The listener that stopped the request, if one did.
     pub refused: Option<Refusal>,
-    /// For a deferred request, the number [`Defer::ask_any`](crate::Defer::ask_any)
+    /// For a deferred request, the number the defer contract's ask
     /// returned when it was asked; `None` for local listeners run by
     /// [`Bus::run_pending`](crate::Bus::run_pending).
     pub ask: Option<u64>,
@@ -818,12 +760,10 @@ pub struct PointInfo {
     /// The time one pass of its listeners should take
     /// ([`PointSpec::budget`]).
     pub budget: Option<Duration>,
-    /// Whether its events go through the journal
-    /// ([`PointSpec::journaled`]).
-    pub journaled: bool,
-    /// Whether it crosses processes ([`PointSpec::relay`]): its events,
-    /// or, on a request, asks from another process.
-    pub relayable: bool,
+    /// What its declaration says for capability contracts
+    /// ([`PointSpec::facets`]): read by their crates
+    /// (`bus_contract_journal::is_journaled(&info.facets)`).
+    pub facets: Vec<crate::Facet>,
     /// Its version ([`PointSpec::version`]).
     pub version: u32,
     /// Its listeners, in the order they run.
@@ -842,162 +782,9 @@ impl PointInfo {
             deadline: DEFAULT_DEADLINE,
             fail_closed: false,
             budget: None,
-            journaled: false,
-            relayable: false,
+            facets: Vec::new(),
             version: 1,
             listeners: Vec::new(),
         }
-    }
-}
-
-/// How long something took over a window of runs
-/// ([`Timings`](crate::Timings)): a listener's runs, or a point's passes.
-/// The quantiles may be approximate (an implementation may read them
-/// from a histogram); the count, total and max are exact.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct TimingStats {
-    /// How many runs.
-    pub count: u64,
-    /// Their time added up.
-    pub total: Duration,
-    /// The longest.
-    pub max: Duration,
-    /// The median.
-    pub p50: Duration,
-    /// The 95th percentile.
-    pub p95: Duration,
-}
-
-impl TimingStats {
-    /// No run.
-    pub fn new() -> TimingStats {
-        TimingStats::default()
-    }
-
-    /// The mean time of a run; zero with no run.
-    pub fn mean(&self) -> Duration {
-        match u32::try_from(self.count) {
-            Ok(0) => Duration::ZERO,
-            Ok(n) => self.total / n,
-            Err(_) => Duration::from_secs_f64(self.total.as_secs_f64() / self.count as f64),
-        }
-    }
-}
-
-/// One listener's time on a point ([`PointTimings::listeners`]).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct ListenerTimings {
-    /// Its id.
-    pub id: String,
-    /// Its owner.
-    pub owner: Option<String>,
-    /// Its runs.
-    pub stats: TimingStats,
-}
-
-impl ListenerTimings {
-    /// The listener `id`, no run.
-    pub fn new(id: impl Into<String>) -> ListenerTimings {
-        ListenerTimings {
-            id: id.into(),
-            owner: None,
-            stats: TimingStats::new(),
-        }
-    }
-}
-
-/// A point's time ([`Timings::points`](crate::Timings::points)): its
-/// passes, its listeners, its budget and how often a pass went over.
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct PointTimings {
-    /// The point.
-    pub point: &'static str,
-    /// Its budget ([`PointSpec::budget`]).
-    pub budget: Option<Duration>,
-    /// Its passes: each the time of the listeners one emit, queued run
-    /// or drained ask ran on one thread.
-    pub passes: TimingStats,
-    /// How many passes went over the budget.
-    pub over_budget: u64,
-    /// Its listeners that ran, in the order they run.
-    pub listeners: Vec<ListenerTimings>,
-}
-
-impl PointTimings {
-    /// The point `point`, no budget, no run.
-    pub fn new(point: &'static str) -> PointTimings {
-        PointTimings {
-            point,
-            budget: None,
-            passes: TimingStats::new(),
-            over_budget: 0,
-            listeners: Vec::new(),
-        }
-    }
-
-    /// Its listeners, the slowest first by their 95th percentile, then
-    /// by their max.
-    pub fn slowest(&self) -> Vec<&ListenerTimings> {
-        let mut out: Vec<&ListenerTimings> = self.listeners.iter().collect();
-        out.sort_by(|a, b| {
-            (b.stats.p95, b.stats.max)
-                .cmp(&(a.stats.p95, a.stats.max))
-                .then_with(|| a.id.cmp(&b.id))
-        });
-        out
-    }
-}
-
-/// A pass of a point's listeners that went over its budget
-/// ([`PointSpec::budget`]): reported to the budget sinks
-/// ([`Timings::add_budget_sink`](crate::Timings::add_budget_sink)). The
-/// pass's results were kept: a budget is not a deadline.
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct OverBudget {
-    /// The point.
-    pub point: &'static str,
-    /// The pass's time: its listeners' times added up.
-    pub took: Duration,
-    /// The point's budget.
-    pub budget: Duration,
-    /// Each listener that ran in the pass, in order, with its time.
-    pub listeners: Vec<(String, Duration)>,
-}
-
-impl OverBudget {
-    /// A pass of `point` that took `took` against `budget`.
-    pub fn new(point: &'static str, took: Duration, budget: Duration) -> OverBudget {
-        OverBudget {
-            point,
-            took,
-            budget,
-            listeners: Vec::new(),
-        }
-    }
-
-    /// The listener that took longest in the pass, with its time.
-    pub fn slowest(&self) -> Option<(&str, Duration)> {
-        self.listeners
-            .iter()
-            .max_by_key(|(_, t)| *t)
-            .map(|(id, t)| (id.as_str(), *t))
-    }
-}
-
-impl fmt::Display for OverBudget {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "hook `{}`: a pass took {:?}, over its budget of {:?}",
-            self.point, self.took, self.budget
-        )?;
-        if let Some((id, t)) = self.slowest() {
-            write!(f, " (slowest `{id}`: {t:?})")?;
-        }
-        Ok(())
     }
 }
