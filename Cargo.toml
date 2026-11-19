@@ -1,6 +1,6 @@
 [package]
 name = "bus-contract"
-version = "0.4.4"
+version = "0.4.5"
 description = "A contract for a hook bus: libraries declare typed hook points and listen with named order (after, before, last), owners and deadlines; the application supplies the implementation and decides on one bus or several. No dependencies."
 readme = "README.md"
 keywords = ["event-bus", "hooks", "listeners", "plugins", "contract"]
@@ -11,6 +11,22 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/quazardous/bus-contract"
 homepage = "https://github.com/quazardous/bus-contract"
 documentation = "https://docs.rs/bus-contract"
+exclude = ["crates/", ".github/", "RELEASING.md"]
 authors = ["The bus-contract contributors"]
 
 [dependencies]
+
+# The repository is a workspace: `bus-contract` (the core, this package)
+# and one crate per capability contract under `crates/`, each versioned
+# and released on its own (RELEASING.md).
+[workspace]
+members = [".", "crates/*"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/quazardous/bus-contract"
+homepage = "https://github.com/quazardous/bus-contract"
+authors = ["The bus-contract contributors"]

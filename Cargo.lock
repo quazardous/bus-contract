@@ -4,4 +4,44 @@ version = 4
 
 [[package]]
 name = "bus-contract"
-version = "0.4.4"
+version = "0.4.5"
+
+[[package]]
+name = "bus-contract-crossing"
+version = "0.1.0"
+dependencies = [
+ "bus-contract",
+ "bus-contract-journal",
+ "bus-contract-testkit",
+]
+
+[[package]]
+name = "bus-contract-defer"
+version = "0.1.0"
+dependencies = [
+ "bus-contract",
+ "bus-contract-testkit",
+]
+
+[[package]]
+name = "bus-contract-journal"
+version = "0.1.0"
+dependencies = [
+ "bus-contract",
+ "bus-contract-testkit",
+]
+
+[[package]]
+name = "bus-contract-testkit"
+version = "0.0.0"
+dependencies = [
+ "bus-contract",
+]
+
+[[package]]
+name = "bus-contract-timings"
+version = "0.1.0"
+dependencies = [
+ "bus-contract",
+ "bus-contract-testkit",
+]

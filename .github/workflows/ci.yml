@@ -16,17 +16,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test --all-targets
-      - run: cargo test --doc
-      - run: cargo doc --no-deps
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace --all-targets
+      - run: cargo test --workspace --doc
+      - run: cargo doc --workspace --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
+      # Every published crate packages and builds on its own.
+      - run: cargo package --workspace --exclude bus-contract-testkit --no-verify --allow-dirty
 
   msrv:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.95
-      - run: cargo test --all-targets
+      - run: cargo test --workspace --all-targets
