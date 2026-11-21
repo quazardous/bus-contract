@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.0.0 (unreleased)
+
+Documentation:
+
+- The README starts with the guarantees in five lines, how to get
+  started (`bus-kernel`, or your own `Bus`), alter against collect in
+  one sentence, and one complete example that compiles as a doctest
+  (the undefined `Search` is gone).
+- The crates and capabilities tables are one table with a "what for"
+  column. Naming points, local listeners, refusals, capabilities,
+  Defer, Timings and crossing move to pages of their own under `docs/`;
+  Journal and Relay join their design note in
+  `docs/journal-and-relay.md`. The README keeps one line and a link
+  for each.
+- A bad `PointId` in a `const` is said to be a compile error, and a few
+  rules get an "if you … then …" sentence next to them.
+
 ## 0.5.0
 
 The one breaking release before 1.0: the core stops naming the
