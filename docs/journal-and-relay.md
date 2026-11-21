@@ -1,4 +1,65 @@
-# Design note: the Journal and Relay capabilities
+# The Journal and Relay capabilities
+
+How to use them ([Journal](#journal), [Relay](#relay)), then why they
+are shaped this way ([Design note](#design-note)). What a relayable
+request means across processes is on [crossing.md](crossing.md).
+
+## Journal
+
+`bus.journal()` (`use bus_contract_journal::BusJournal;`) returns
+`Option<&dyn Journal>`. An event point declared with the `JOURNALED`
+facet is published through the journal instead of emitted: the
+publisher gets a number and moves on, and the listeners hear each event
+once, in number order, on a thread of the implementation's (a pump). A
+slow listener delays the next events, not the publisher.
+
+- `publish::<P>(input)` / `publish_caused::<P>(input, cause)`: the
+  entry's number, from 1. Refused on a point not declared journaled: if
+  you publish to a point, declare it with the `JOURNALED` facet (or a
+  relayable one).
+- `since(seq, limit)`: the entries after a number, with `gap` set when
+  some left the journal's window; `last_seq()`.
+- `wait(patterns, seq, timeout)` / `wait_for::<P>`: the next entry of a
+  kind (`vault.*`, see `kind_matches`), at once if already there.
+- `flush(timeout)`: every entry recorded so far delivered (before an
+  exit, in tests).
+
+## Relay
+
+`bus.relay()` (`use bus_contract_crossing::BusCrossing;`) returns
+`Option<&dyn Relay>`, on a bus that offers the journal. An event point
+declared with the `relayable_event::<P>()` facet (codec
+`Codec::of::<P>()`) has its input written as text and read back by
+another process (`Relayed`: the format is the application's). The
+transport is not part of the contract (see [crossing.md](crossing.md)).
+
+- `cursor()`: where a reader starting now stands (the journal's run and
+  last number). `resume(cursor, limit)`: the relayable entries after
+  it, and `lost` when the reader missed some (`Gap`: the window;
+  `Restarted`: the process started again and numbers with it). A
+  reader that lost entries resyncs, then applies the ones returned.
+- `ingest(origin, entry)`: an entry relayed in is recorded with its
+  origin and delivered to its point's listeners like a local one. A
+  kind not declared here is kept as text and heard by no one; a point
+  declared here but not relayable, or at another version, is refused.
+  Entries taken in are not served again.
+
+```rust,ignore
+pub const POINTS: &[PointDecl] = &[
+    PointDecl::of::<LibraryImported>("Photos were imported.")
+        .facets(&[relayable_event::<LibraryImported>()]),
+    PointDecl::of::<StepComputed>("A render step was computed.").facets(&[JOURNALED]),
+];
+
+// the node publishes and moves on:
+bus.journal().expect("declared journaled").publish::<LibraryImported>(imported)?;
+// its server answers a desktop reader:
+let read = bus.relay().expect("declared relayable").resume(cursor, 256);
+// the desktop takes the entries in; its listeners hear them in order:
+for entry in read.entries { desktop.relay().unwrap().ingest(&Origin::process("node"), entry)?; }
+```
+
+## Design note
 
 The core contract delivers an emit to its listeners inline, on the
 emitting thread, in a declared order. Applications that already run a
@@ -8,7 +69,7 @@ the contract: two vocabularies, anonymous subscribers draining channels.
 `Journal` and `Relay` let such a bus implement the contract's missing
 parts instead, as optional capabilities shaped like `Defer`.
 
-## Decisions
+### Decisions
 
 **Optional, found at run time.** The journal and the relay are
 capability contracts of their own (`bus-contract-journal`,
@@ -82,7 +143,7 @@ covers additive changes. A version on the point covers the rest: the
 same version on both sides, or the crossing is refused, rather than
 read wrongly.
 
-## Not decided here
+### Not decided here
 
 - Whether `Journal` entries of kinds with no point (an implementation's
   own untyped facts) get a contract type: the journal keeps them as
